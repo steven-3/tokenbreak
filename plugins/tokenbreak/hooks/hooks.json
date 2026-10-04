@@ -1,0 +1,4 @@
+{
+  "description": "Tokenbreak: the ad banner above the prompt, the Theater pane, the /ads command and the status line",
+  "modules": ["./register.tsx"]
+}
