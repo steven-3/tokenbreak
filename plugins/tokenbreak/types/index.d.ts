@@ -4,11 +4,21 @@
 // monorepo (the API's zod schemas). A hooks module cannot import npm
 // packages, so they are copied by hand: change both together.
 
-export type AdFormat = 'status' | 'banner' | 'theater'
+export type AdFormat = 'banner' | 'theater'
 
 export type AdImage = {
   /** A whole PNG, base64; at most 2 MiB decoded (the Image element's limit). */
   png: string
+  width: number
+  height: number
+}
+
+/** A short silent loop, as PNG frames played in order. */
+export type AdVideo = {
+  /** Whole PNGs, base64, all the same size. */
+  frames: string[]
+  /** Frames a second, 1 to 30. */
+  fps: number
   width: number
   height: number
 }
@@ -18,13 +28,19 @@ export type Ad = {
   format: AdFormat
   brand: string
   glyph?: string
+  /** Banner only: a square brand mark drawn in two cells before the brand, where the terminal shows pictures; else `glyph`. */
+  logo?: AdImage
   headline: string
+  /** Banner only: the button's words (`Start free`); `Learn more` when absent. */
+  cta?: string
   /** `#rrggbb` */
   accent: string
   /** Tracked click-through (`/c/<token>`), which logs and redirects. */
   clickUrl: string
   /** Theater only. */
   image?: AdImage
+  /** Theater only: plays in place of `image` where the terminal shows pictures. */
+  video?: AdVideo
   isHouse: boolean
 }
 
@@ -47,6 +63,9 @@ export type ImpressionBatch = {
   impressions: Impression[]
 }
 
+/** How the banner is drawn: `pill` a colored call-to-action, `rule` an accent bar and an underlined link, `card` a bordered box. */
+export type BannerStyle = 'pill' | 'rule' | 'card'
+
 /** Where the ads on screen came from: the API, the store's last batch, or the module itself. */
 export type AdSource = 'server' | 'cache' | 'built-in'
 
@@ -65,6 +84,7 @@ declare module 'claude-code' {
       bannerIndex: number
       pausedUntil: number | null
       theater: TheaterShowing | null
+      bannerStyle: BannerStyle
     }
   }
 }

@@ -1,8 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { Ad, AdSource, Impression, TheaterShowing } from '../types'
+import type { Ad, AdSource, BannerStyle, Impression, TheaterShowing } from '../types'
 import {
+  BANNER_STYLES,
+  bannerStyleOf,
   cacheable,
   canDockTheater,
   capQueue,
@@ -14,18 +16,20 @@ import {
   HOUSE_ADS,
   impressionKey,
   isHex,
+  tint,
   linkable,
+  posterOf,
   parseBatch,
   pauseUntil,
   queueOf,
   rotationMs,
-  statusAdOf,
-  statusLine,
   THEATER_DELAY_MS,
+  THEATER_MIN_COLUMNS,
   THEATER_PANE,
   THEATER_SNOOZE_MS,
   theaterArt,
   theaterOf,
+  withoutFrames,
   type Seen,
 } from './core'
 
@@ -39,14 +43,16 @@ const source = atom({ plugin: 'tokenbreak', key: 'source' } as const, 'built-in'
 const bannerIndex = atom({ plugin: 'tokenbreak', key: 'bannerIndex' } as const, 0)
 const pausedUntil = atom({ plugin: 'tokenbreak', key: 'pausedUntil' } as const, null as number | null)
 const theater = atom({ plugin: 'tokenbreak', key: 'theater' } as const, null as TheaterShowing | null)
+const bannerStyle = atom({ plugin: 'tokenbreak', key: 'bannerStyle' } as const, 'pill' as BannerStyle)
 
-const AD_TAG = '#FFE600'
-const INK = '#141414'
+const FALLBACK_ACCENT = '#FFE600'
 
 /** The module's own bookkeeping, set afresh by `register`: a reload starts it over. */
 type Run = {
   endpoint: string
   isTheaterOn: boolean
+  /** Whether ads draw pictures (logos, Theater images, video): the `pictures` option. */
+  arePicturesOn: boolean
   rotationMs: number
   deviceId: string
   fetchedAt: number
@@ -61,6 +67,14 @@ type Run = {
   seen?: Seen
   /** The banner the band last drew, undefined while it shows nothing. */
   drawnBanner?: string
+  /** Why the Theater last opened or stayed shut, for `/ads status`. */
+  theaterNote: string
+  /** Each video ad's frames by ad id; `$.state` holds the ads without them. */
+  frames: Map<string, readonly string[]>
+  /** Plays the Theater's video while the pane is open. */
+  videoTimer?: Timer
+  /** The last video's frame swaps, for `/ads status`. */
+  video: { swapped: number; refused: number; reason?: string }
   timers: Timer[]
 }
 
@@ -68,6 +82,7 @@ function runOf(options: PluginOptions): Run {
   return {
     endpoint: String(options.endpoint ?? 'https://tokenbreak.dev').replace(/\/+$/, ''),
     isTheaterOn: options.theater !== 'off',
+    arePicturesOn: options.pictures !== 'off',
     rotationMs: rotationMs(options.frequency),
     deviceId: '',
     fetchedAt: 0,
@@ -75,16 +90,26 @@ function runOf(options: PluginOptions): Run {
     isRefreshing: false,
     isFlushing: false,
     theaterSnoozedUntil: 0,
+    theaterNote: 'no turn has run long enough yet',
+    video: { swapped: 0, refused: 0 },
+    frames: new Map(),
     timers: [],
   }
 }
 
 let run: Run = runOf({})
 
-async function showStatus($: EngineInterface) {
-  const until = await read($, pausedUntil)
+/** The status line stays empty; an older build may have left a line there. */
+/** Puts `list` on screen: frames into module memory, the rest into `$.state`. */
+async function showAds($: EngineInterface, list: readonly Ad[]) {
+  run.frames = new Map(list.flatMap(ad => (ad.video === undefined ? [] : [[ad.id, ad.video.frames] as const])))
+  await update($, ads, () => withoutFrames(list))
+}
 
-  $.ui.status(until === null ? statusLine(statusAdOf(await read($, ads))) : 'tokenbreak · paused (/ads resume)')
+const framesOf = (ad: Ad) => run.frames.get(ad.id) ?? []
+
+async function showStatus($: EngineInterface) {
+  $.ui.status(undefined)
 }
 
 async function setPause($: EngineInterface, until: number | null) {
@@ -122,7 +147,7 @@ async function refresh($: EngineInterface) {
     if (batch !== undefined && batch.ads.length > 0) {
       run.fetchedAt = await $.clock.now()
       run.ttlMs = batch.ttlSeconds * 1000
-      await update($, ads, () => batch.ads)
+      await showAds($, batch.ads)
       await update($, source, () => 'server' as AdSource)
       await $.store.set('batch', cacheable(batch))
       await showStatus($)
@@ -195,22 +220,46 @@ async function tick($: EngineInterface) {
 async function openTheater($: EngineInterface, turnId: string) {
   const now = await $.clock.now()
 
-  if (
-    run.runningTurn !== turnId ||
-    !canDockTheater(run.seen) ||
-    now < run.theaterSnoozedUntil ||
-    (await read($, pausedUntil)) !== null
-  ) {
+  const shut =
+    run.runningTurn !== turnId
+      ? 'the turn ended within 3s'
+      : !canDockTheater(run.seen)
+        ? run.seen === undefined
+          ? "the band hasn't reported the terminal's size"
+          : run.seen.columns < THEATER_MIN_COLUMNS
+            ? `the terminal is ${run.seen.columns} columns, under ${THEATER_MIN_COLUMNS}`
+            : 'not the fullscreen layout'
+        : now < run.theaterSnoozedUntil
+          ? `snoozed for ${describeWait(run.theaterSnoozedUntil - now)} after you closed it`
+          : (await read($, pausedUntil)) !== null
+            ? 'ads are paused'
+            : undefined
+
+  if (shut !== undefined) {
+    run.theaterNote = `stayed shut: ${shut}`
+
     return
   }
 
-  const ad = theaterOf(await read($, ads))
+  const list = await read($, ads)
+  const ad = theaterOf(list, currentBanner(list, await read($, bannerIndex)))
 
   await update($, theater, () => ({ adId: ad.id, turnId, isPlaced: false }))
 
-  const opened = await $.ui.open({ id: THEATER_PANE, title: 'Tokenbreak' })
+  const opened = await $.ui.open({ id: THEATER_PANE, title: 'Tokenbreak' }).catch((error: unknown) => {
+    run.theaterNote = `stayed shut: opening the pane failed (${String(error).slice(0, 120)})`
+
+    return undefined
+  })
+
+  if (opened === undefined) {
+    await update($, theater, () => null)
+
+    return
+  }
 
   if (!opened.isPlaced || run.runningTurn !== turnId) {
+    run.theaterNote = opened.isPlaced ? 'stayed shut: the turn ended while it opened' : "stayed shut: Claude Code didn't place the pane"
     // Never leave a pane waiting undrawn for a wider terminal.
     await $.ui.close({ id: THEATER_PANE })
     await update($, theater, () => null)
@@ -219,6 +268,54 @@ async function openTheater($: EngineInterface, turnId: string) {
   }
 
   await update($, theater, () => ({ adId: ad.id, turnId, isPlaced: true }))
+  run.theaterNote = `opened ${ad.brand}${
+    framesOf(ad).length === 0
+      ? ''
+      : arePicturesOn()
+        ? ` (video, ${framesOf(ad).length} frames)`
+        : ' (text only: pictures are off in /config)'
+  }`
+  playVideo($, ad)
+}
+
+/** Steps the Theater's Image through the ad's frames until `stopVideo`. */
+function playVideo($: EngineInterface, ad: Ad) {
+  stopVideo()
+
+  const video = ad.video
+  const frames = framesOf(ad)
+
+  if (video === undefined || frames.length < 2 || !arePicturesOn()) {
+    return
+  }
+
+  let frame = posterOf(frames.length)
+
+  run.video = { swapped: 0, refused: 0 }
+  run.videoTimer = $.clock.every(Math.round(1000 / video.fps), () => {
+    frame = (frame + 1) % frames.length
+    void $.ui
+      .blit({ requestId: THEATER_PANE, key: 'theater-image', source: { png: frames[frame] ?? '' } })
+      .then(result => {
+        if (result.deny === undefined) {
+          run.video.swapped += 1
+        } else {
+          run.video.refused += 1
+          run.video.reason = result.deny
+        }
+      })
+      .catch((error: unknown) => {
+        run.video.refused += 1
+        run.video.reason = String(error).slice(0, 160)
+      })
+  })
+}
+
+const arePicturesOn = () => run.arePicturesOn
+
+function stopVideo() {
+  run.videoTimer?.cancel()
+  run.videoTimer = undefined
 }
 
 async function startSession($: EngineInterface) {
@@ -226,11 +323,13 @@ async function startSession($: EngineInterface) {
     timer.cancel()
   }
 
+  stopVideo()
+
   await $.command
     .register({
       name: 'ads',
-      description: 'Tokenbreak ads: status, pause [1h|30m|today], resume, report',
-      argumentHint: '[status|pause 1h|pause today|resume|report]',
+      description: 'Tokenbreak ads: status, next, style, pause [1h|30m|today], resume, report',
+      argumentHint: '[status|next|style pill|pause 1h|resume|report]',
       immediate: true,
     })
     .catch(() => undefined)
@@ -244,14 +343,17 @@ async function startSession($: EngineInterface) {
   }
 
   const cached = parseBatch(JSON.stringify((await $.store.get('batch')) ?? null))
+  const storedStyle = await $.store.get('bannerStyle')
 
   if (cached !== undefined && cached.ads.length > 0) {
-    await update($, ads, () => cached.ads)
+    await showAds($, cached.ads)
     await update($, source, () => 'cache' as AdSource)
   } else {
-    await update($, ads, () => [...HOUSE_ADS])
+    await showAds($, HOUSE_ADS)
     await update($, source, () => 'built-in' as AdSource)
   }
+
+  await update($, bannerStyle, () => bannerStyleOf(storedStyle))
 
   const storedPause = await $.store.get('pausedUntil')
   const now = await $.clock.now()
@@ -281,6 +383,27 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
     return `Tokenbreak paused for ${describeWait(until - now)}. /ads resume brings it back.`
   }
 
+  if (verb === 'next') {
+    await update($, bannerIndex, index => index + 1)
+
+    const ad = currentBanner(await read($, ads), await read($, bannerIndex))
+
+    return ad === undefined ? 'No banners to show.' : `Showing ad ${ad.id}.`
+  }
+
+  if (verb === 'style') {
+    const wanted = rest[0]
+
+    if (!BANNER_STYLES.includes(wanted as BannerStyle)) {
+      return `Usage: /ads style [${BANNER_STYLES.join('|')}] (now ${await read($, bannerStyle)})`
+    }
+
+    await update($, bannerStyle, () => wanted as BannerStyle)
+    await $.store.set('bannerStyle', wanted)
+
+    return `Banner style: ${wanted}.`
+  }
+
   if (verb === 'resume') {
     await setPause($, null)
 
@@ -303,7 +426,7 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
   }
 
   if (verb !== 'status') {
-    return 'Usage: /ads [status|pause 1h|pause today|resume|report]'
+    return 'Usage: /ads [status|next|style pill|pause 1h|pause today|resume|report]'
   }
 
   const until = await read($, pausedUntil)
@@ -321,13 +444,17 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
     `Tokenbreak · ${until === null ? 'on' : `paused, ${describeWait(until - now)} left`}`,
     `Showing: ${ad === undefined ? 'nothing' : `ad ${ad.id}`}`,
     `Ads from: ${origin}`,
-    `Theater: ${run.isTheaterOn ? 'on (fullscreen layout, 144+ columns, turns over 3s)' : 'off'}`,
+    `Theater: ${run.isTheaterOn ? `on (fullscreen layout, 144+ columns, turns over 3s); last turn ${run.theaterNote}` : 'off'}`,
+    ...(run.video.swapped + run.video.refused > 0
+      ? [`Video: ${run.video.swapped} frames swapped, ${run.video.refused} refused${run.video.reason === undefined ? '' : ` (${run.video.reason})`}`]
+      : []),
     `Impressions queued: ${queued}`,
     `Device: ${run.deviceId.slice(0, 8)}… (anonymous; accounts and earnings arrive later)`,
   ].join('\n')
 }
 
 async function closeTurn($: EngineInterface, turnId: string) {
+  stopVideo()
   run.runningTurn = undefined
   run.theaterTimer?.cancel()
   run.theaterTimer = undefined
@@ -353,12 +480,6 @@ async function closeTurn($: EngineInterface, turnId: string) {
 
   if (showing?.isPlaced === true && showing.turnId === turnId) {
     impressions.push({ adId: showing.adId, format: 'theater', at, turnId })
-  }
-
-  const sponsor = statusAdOf(await read($, ads))
-
-  if (sponsor !== undefined) {
-    impressions.push({ adId: sponsor.id, format: 'status', at, turnId })
   }
 
   await enqueue($, impressions)
@@ -404,23 +525,68 @@ export const register: Register = (on, options) => {
     run.drawnBanner = ad.id
 
     const { Box, Text, Link, Button } = $.ui.resolve(e)
+    // Only the terminal draws pictures; elsewhere the glyph stands in for the logo.
+    const Image = e.surface === 'terminal' && arePicturesOn() ? $.ui.resolve(e).Image : undefined
+    const style = await read($, bannerStyle)
     const href = linkable(ad.clickUrl)
-
-    return (
-      <Box flexDirection="row" gap={1} width={e.props.bodyColumns}>
-        <Text backgroundColor={AD_TAG} color={INK} bold>
-          {' AD '}
+    const accent = isHex(ad.accent) ? ad.accent : FALLBACK_ACCENT
+    const logo = Image === undefined ? undefined : ad.logo
+    const cta = ad.cta ?? 'Learn more'
+    const mark =
+      logo !== undefined && Image !== undefined ? (
+        <Image key="banner-logo" source={{ png: logo.png }} columns={2} rows={1} alt={ad.glyph ?? ' '} />
+      ) : (
+        <Text color={accent}>{ad.glyph ?? '●'}</Text>
+      )
+    // Brand and headline are one link, so the whole line opens the ad.
+    const words = (
+      <Text wrap="truncate-end">
+        <Text color={accent} bold>
+          {ad.brand}
         </Text>
-        <Text color={isHex(ad.accent) ? ad.accent : undefined} bold>
-          {ad.glyph === undefined ? ad.brand : `${ad.glyph} ${ad.brand}`}
-        </Text>
-        <Box flexGrow={1} flexShrink={1}>
-          <Text wrap="truncate-end">
-            {ad.headline}
+        {'  '}
+        {ad.headline}
+      </Text>
+    )
+    const action =
+      href === undefined ? undefined : style === 'pill' ? (
+        // The brand color on a dark tint of itself: reads as a button without a solid block of color.
+        <Link href={href}>
+          <Text backgroundColor={tint(accent, 0.22)} color={accent} bold>
+            {` ${cta} ↗ `}
           </Text>
+        </Link>
+      ) : (
+        <Link href={href}>
+          <Text color={accent} bold underline>
+            {`${cta} →`}
+          </Text>
+        </Link>
+      )
+    const row = (
+      <Box flexDirection="row" gap={1} flexGrow={1}>
+        {style === 'rule' && <Text color={accent}>▎</Text>}
+        {mark}
+        <Box flexGrow={1} flexShrink={1}>
+          {href === undefined ? words : <Link href={href}>{words}</Link>}
         </Box>
-        {href !== undefined && <Link href={href} label="open ↗" />}
-        <Button key="hide" label="hide 1h" plain onPress={() => void hideFor($, 3_600_000)} />
+        {action}
+        <Box flexDirection="row" gap={1} marginLeft={1}>
+          <Text dimColor>sponsored</Text>
+          <Text dimColor>·</Text>
+          <Button key="hide" label="✕" plain dimColor onPress={() => void hideFor($, 3_600_000)} />
+        </Box>
+      </Box>
+    )
+
+    // marginTop keeps a blank row between the banner and the spinner or transcript above it.
+    return style === 'card' ? (
+      <Box width={e.props.bodyColumns} borderStyle="round" borderColor={accent} paddingX={1}>
+        {row}
+      </Box>
+    ) : (
+      <Box width={e.props.bodyColumns} marginTop={1}>
+        {row}
       </Box>
     )
   })
@@ -430,55 +596,58 @@ export const register: Register = (on, options) => {
     const list = await read($, ads)
     const ad = list.find(one => one.id === showing?.adId) ?? theaterOf(list)
     const href = linkable(ad.clickUrl)
+    const accent = isHex(ad.accent) ? ad.accent : FALLBACK_ACCENT
     const width = Math.max(10, Math.min(e.props.bodyColumns - 2, 72))
-
-    if (e.surface === 'terminal') {
-      const { Box, Text, Link, Image } = $.ui.resolve(e)
-      const picture = ad.image
-      const art = picture === undefined ? theaterArt() : undefined
-      const pixelsWide = picture?.width ?? art?.width ?? 16
-      const pixelsHigh = picture?.height ?? art?.height ?? 9
-      // A cell is about twice as tall as it is wide.
-      const rows = Math.max(3, Math.min(255, Math.round((width * pixelsHigh) / pixelsWide / 2)))
-
-      return (
-        <Box flexDirection="column" gap={1}>
-          <Image
-            key="theater-image"
-            source={picture !== undefined ? { png: picture.png } : { rgba: art?.rgba ?? '', width: pixelsWide, height: pixelsHigh }}
-            columns={Math.min(255, width)}
-            rows={rows}
-            alt={`${ad.brand}: ${ad.headline}`}
-          />
-          <Box flexDirection="row" gap={1}>
-            <Text backgroundColor={AD_TAG} color={INK} bold>
-              {' AD '}
-            </Text>
-            <Text color={isHex(ad.accent) ? ad.accent : undefined} bold>
-              {ad.brand}
-            </Text>
-          </Box>
-          <Text>{ad.headline}</Text>
-          {href !== undefined && <Link href={href} label="learn more ↗" />}
-          <Text dimColor>Closes when Claude finishes. /ads pause hides ads.</Text>
+    const { Box, Text, Link } = $.ui.resolve(e)
+    const isTextOnly = e.surface !== 'terminal' || !arePicturesOn()
+    // The same parts as the banner: brand in its color, a dim label, a button in the brand's color.
+    const card = (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="row" gap={1}>
+          <Text color={accent} bold>
+            {isTextOnly ? `${ad.glyph ?? '●'} ${ad.brand}` : ad.brand}
+          </Text>
+          <Text dimColor>sponsored</Text>
         </Box>
-      )
+        <Text>{ad.headline}</Text>
+        {href !== undefined && (
+          <Link href={href}>
+            <Text backgroundColor={tint(accent, 0.22)} color={accent} bold>
+              {` ${ad.cta ?? 'Learn more'} ↗ `}
+            </Text>
+          </Link>
+        )}
+        <Text dimColor>Closes when Claude finishes · /ads pause hides ads</Text>
+      </Box>
+    )
+
+    if (isTextOnly || e.surface !== 'terminal') {
+      return card
     }
 
-    const { Box, Text, Link } = $.ui.resolve(e)
+    const { Image } = $.ui.resolve(e)
+    const frames = framesOf(ad)
+    // A video starts on its poster frame; playVideo swaps the rest in.
+    const picture =
+      ad.video !== undefined && frames.length > 0
+        ? { png: frames[posterOf(frames.length)] ?? '', width: ad.video.width, height: ad.video.height }
+        : ad.image
+    const art = picture === undefined ? theaterArt() : undefined
+    const pixelsWide = picture?.width ?? art?.width ?? 16
+    const pixelsHigh = picture?.height ?? art?.height ?? 9
+    // A cell is about twice as tall as it is wide.
+    const rows = Math.max(3, Math.min(255, Math.round((width * pixelsHigh) / pixelsWide / 2)))
 
     return (
       <Box flexDirection="column" gap={1}>
-        <Box flexDirection="row" gap={1}>
-          <Text backgroundColor={AD_TAG} color={INK} bold>
-            {' AD '}
-          </Text>
-          <Text color={isHex(ad.accent) ? ad.accent : undefined} bold>
-            {ad.glyph === undefined ? ad.brand : `${ad.glyph} ${ad.brand}`}
-          </Text>
-        </Box>
-        <Text>{ad.headline}</Text>
-        {href !== undefined && <Link href={href} label="learn more ↗" />}
+        <Image
+          key="theater-image"
+          source={picture !== undefined ? { png: picture.png } : { rgba: art?.rgba ?? '', width: pixelsWide, height: pixelsHigh }}
+          columns={Math.min(255, width)}
+          rows={rows}
+          alt={`${ad.brand}: ${ad.headline}`}
+        />
+        {card}
       </Box>
     )
   })
@@ -504,6 +673,8 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.close', { id: 'tokenbreak-theater' }, async ($, e, next) => {
+    stopVideo()
+
     if (e.origin.kind === 'person') {
       await snoozeTheater($)
     }

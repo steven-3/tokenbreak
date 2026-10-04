@@ -1,4 +1,4 @@
-import type { Ad, AdBatch, AdFormat, Impression } from '../types'
+import type { Ad, AdBatch, AdFormat, AdVideo, BannerStyle, Impression } from '../types'
 
 export const THEATER_PANE = 'tokenbreak-theater'
 export const QUEUE_CAP = 200
@@ -10,8 +10,7 @@ export const THEATER_DELAY_MS = 3_000
 export const THEATER_MIN_COLUMNS = 144
 /** Closing the Theater by hand keeps it away this long. */
 export const THEATER_SNOOZE_MS = 30 * 60_000
-export const STATUS_TEXT = 'tokenbreak · house ads · earning opens soon'
-export const FORMATS: readonly AdFormat[] = ['banner', 'theater', 'status']
+export const FORMATS: readonly AdFormat[] = ['banner', 'theater']
 
 export const ROTATION_MS = { chill: 90_000, normal: 40_000, max: 20_000 } as const
 
@@ -61,15 +60,6 @@ export const HOUSE_ADS: readonly Ad[] = [
     clickUrl: 'https://tokenbreak.dev/formats',
     isHouse: true,
   },
-  {
-    id: 'house-status',
-    format: 'status',
-    brand: 'Tokenbreak',
-    headline: 'tokenbreak.dev',
-    accent: '#FFE600',
-    clickUrl: 'https://tokenbreak.dev',
-    isHouse: true,
-  },
 ]
 
 const HEX = /^#[0-9a-fA-F]{6}$/
@@ -108,7 +98,41 @@ export const plain = (value: string, max: number): string =>
     .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
     .slice(0, max)
 
-const isFormat = (value: unknown): value is AdFormat => value === 'banner' || value === 'theater' || value === 'status'
+/** A `{ png, width, height }` whose PNG decodes to at most `maxBytes`. */
+const isImage = (value: Record<string, unknown> | undefined, maxBytes: number): value is Record<string, unknown> =>
+  typeof value === 'object' &&
+  value !== null &&
+  typeof value.png === 'string' &&
+  value.png.length <= Math.ceil(maxBytes / 3) * 4 &&
+  typeof value.width === 'number' &&
+  typeof value.height === 'number'
+
+/** A loop of at most 240 frames and 8 MiB of PNG, its rate held to 1-30 fps; undefined when it isn't one. */
+function videoOf(raw: unknown): AdVideo | undefined {
+  if (typeof raw !== 'object' || raw === null) {
+    return undefined
+  }
+
+  const video = raw as Record<string, unknown>
+  const frames = video.frames
+
+  if (
+    !Array.isArray(frames) ||
+    frames.length === 0 ||
+    frames.length > 240 ||
+    !frames.every(frame => typeof frame === 'string') ||
+    frames.reduce((sum: number, frame: string) => sum + frame.length, 0) > Math.ceil((8 * 1024 * 1024) / 3) * 4 ||
+    typeof video.fps !== 'number' ||
+    typeof video.width !== 'number' ||
+    typeof video.height !== 'number'
+  ) {
+    return undefined
+  }
+
+  return { frames: frames as string[], fps: Math.min(30, Math.max(1, video.fps)), width: video.width, height: video.height }
+}
+
+const isFormat = (value: unknown): value is AdFormat => value === 'banner' || value === 'theater'
 
 function adOf(raw: unknown): Ad | undefined {
   if (typeof raw !== 'object' || raw === null) {
@@ -117,14 +141,10 @@ function adOf(raw: unknown): Ad | undefined {
 
   const ad = raw as Record<string, unknown>
   const image = ad.image as Record<string, unknown> | undefined
-  const hasImage =
-    typeof image === 'object' &&
-    image !== null &&
-    typeof image.png === 'string' &&
-    // base64 of at most 2 MiB
-    image.png.length <= Math.ceil((2 * 1024 * 1024) / 3) * 4 &&
-    typeof image.width === 'number' &&
-    typeof image.height === 'number'
+  const hasImage = isImage(image, 2 * 1024 * 1024)
+  const logo = ad.logo as Record<string, unknown> | undefined
+  const hasLogo = isImage(logo, 64 * 1024)
+  const video = videoOf(ad.video)
 
   if (
     typeof ad.id !== 'string' ||
@@ -142,10 +162,15 @@ function adOf(raw: unknown): Ad | undefined {
     brand: plain(ad.brand, 24),
     ...(typeof ad.glyph === 'string' && ad.glyph.length > 0 && { glyph: plain(ad.glyph, 2) }),
     headline: plain(ad.headline, 80),
+    ...(typeof ad.cta === 'string' && ad.cta.trim().length > 0 && { cta: plain(ad.cta.trim(), 24) }),
     accent: isHex(ad.accent) ? ad.accent : '#FFE600',
     clickUrl: ad.clickUrl,
     ...(hasImage && {
       image: { png: image.png as string, width: image.width as number, height: image.height as number },
+    }),
+    ...(video !== undefined && { video }),
+    ...(hasLogo && {
+      logo: { png: logo.png as string, width: logo.width as number, height: logo.height as number },
     }),
     isHouse: ad.isHouse === true,
   }
@@ -173,27 +198,50 @@ export function parseBatch(text: string): AdBatch | undefined {
 export function cacheable(batch: AdBatch): AdBatch {
   return JSON.stringify(batch).length <= 1_500_000
     ? batch
-    : { ...batch, ads: batch.ads.map(({ image: _image, ...ad }) => ad) }
+    : { ...batch, ads: batch.ads.map(({ image: _image, video: _video, ...ad }) => ad) }
 }
 
 export const bannersOf = (ads: readonly Ad[]) => ads.filter(ad => ad.format === 'banner')
 
-/** The Status Sponsor ad to show, if the batch has one. */
-export const statusAdOf = (ads: readonly Ad[]) => ads.find(ad => ad.format === 'status')
+/**
+ * The ads as `$.state` holds them: each video's frames left out, its size and
+ * rate kept. A session's state takes 4 MiB of JSON; one video's frames can fill that.
+ */
+export const withoutFrames = (ads: readonly Ad[]): Ad[] =>
+  ads.map(ad => (ad.video === undefined ? ad : { ...ad, video: { ...ad.video, frames: [] } }))
 
-/** The status line text: the sponsor's line when there is one, else the default. */
-export function statusLine(ad: Ad | undefined): string {
-  if (ad === undefined) {
-    return STATUS_TEXT
-  }
+/** The frame a video shows before it plays: three quarters in, past any fade-in. */
+export const posterOf = (frameCount: number) => Math.floor(frameCount * 0.75)
 
-  const line = `Ad · ${ad.brand}: ${ad.headline}`
+export const BANNER_STYLES = ['pill', 'rule', 'card'] as const
 
-  return line.length > 72 ? `${line.slice(0, 71)}…` : line
+export const bannerStyleOf = (value: unknown): BannerStyle =>
+  BANNER_STYLES.includes(value as BannerStyle) ? (value as BannerStyle) : 'pill'
+
+/** `hex` mixed into `base` by `amount` (0 to 1): a dark tint of a brand color for a button's ground. */
+export function tint(hex: string, amount: number, base = '#141414'): string {
+  const channel = (color: string, at: number) => parseInt(color.slice(at, at + 2), 16)
+
+  return `#${[1, 3, 5]
+    .map(at => Math.round(channel(base, at) + (channel(hex, at) - channel(base, at)) * amount))
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('')}`
 }
 
-export const theaterOf = (ads: readonly Ad[]): Ad =>
-  ads.find(ad => ad.format === 'theater') ?? (HOUSE_ADS.find(ad => ad.format === 'theater') as Ad)
+/** Ink that reads on `hex`: near-black on light colors, white on dark ones. */
+export function inkOn(hex: string): string {
+  const [r, g, b] = [1, 3, 5].map(at => parseInt(hex.slice(at, at + 2), 16) / 255)
+  const linear = (c: number) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)
+  const luminance = 0.2126 * linear(r ?? 0) + 0.7152 * linear(g ?? 0) + 0.0722 * linear(b ?? 0)
+
+  return luminance > 0.4 ? '#141414' : '#FFFFFF'
+}
+
+/** The Theater ad: the banner brand's own when it has one, so one brand holds both slots; else the batch's first. */
+export const theaterOf = (ads: readonly Ad[], banner?: Ad): Ad =>
+  ads.find(ad => ad.format === 'theater' && ad.brand === banner?.brand) ??
+  ads.find(ad => ad.format === 'theater') ??
+  (HOUSE_ADS.find(ad => ad.format === 'theater') as Ad)
 
 export function currentBanner(ads: readonly Ad[], index: number): Ad | undefined {
   const banners = bannersOf(ads)

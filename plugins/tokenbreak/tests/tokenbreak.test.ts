@@ -18,7 +18,7 @@ describe('the banner', () => {
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface })
 
-      expect(await ui.find({ type: 'Text', text: ' AD ' }), surface).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: 'sponsored' }), surface).toBeDefined()
       expect((await ui.find({ type: 'Text', text: /Acme DB|Shipfast/ }))?.text).toContain('Acme DB')
       expect(await ui.find({ type: 'Text', text: 'scales to zero' })).toBeDefined()
       expect((await ui.find({ type: 'Link' }))?.props.href).toBe('https://tokenbreak.dev/c/acme')
@@ -67,7 +67,7 @@ describe('the banner', () => {
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface, props: { ...BAND.props, hasSurvey: true } })
 
-      expect(await ui.find({ type: 'Text', text: ' AD ' }), surface).toBeUndefined()
+      expect(await ui.find({ type: 'Text', text: 'sponsored' }), surface).toBeUndefined()
       await ui.unmount()
     }
   })
@@ -82,18 +82,17 @@ describe('the banner', () => {
     const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'terminal' })
 
     await ui.press({ key: 'hide' })
-    expect(await ui.find({ type: 'Text', text: ' AD ' }), 'hidden after the press').toBeUndefined()
-    expect(world.statuses.at(-1)).toContain('paused')
+    expect(await ui.find({ type: 'Text', text: 'sponsored' }), 'hidden after the press').toBeUndefined()
 
     const resumed = await $.command.run(command('resume'))
 
     expect(resumed.text).toContain('resumed')
-    expect(await ui.find({ type: 'Text', text: ' AD ' }), 'back after /ads resume').toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'sponsored' }), 'back after /ads resume').toBeDefined()
 
     const paused = await $.command.run(command('pause today'))
 
     expect(paused.text).toContain('paused')
-    expect(await ui.find({ type: 'Text', text: ' AD ' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'sponsored' })).toBeUndefined()
     expect(world.store.get('pausedUntil')).toBeGreaterThan(START)
   })
 
@@ -107,9 +106,9 @@ describe('the banner', () => {
     const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'terminal' })
 
     await $.command.run(command('pause 30m'))
-    expect(await ui.find({ type: 'Text', text: ' AD ' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'sponsored' })).toBeUndefined()
     await clock.advance(30 * 60_000 + 1)
-    expect(await ui.find({ type: 'Text', text: ' AD ' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'sponsored' })).toBeDefined()
   })
 })
 

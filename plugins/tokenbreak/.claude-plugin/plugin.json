@@ -1,8 +1,10 @@
 {
   "name": "tokenbreak",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Opt-in ads for Claude Code: a banner above the prompt and a Theater pane while Claude works. Unofficial, not affiliated with Anthropic.",
-  "author": { "name": "Tokenbreak" },
+  "author": {
+    "name": "Tokenbreak"
+  },
   "homepage": "https://tokenbreak.dev",
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -18,14 +20,31 @@
       "title": "Banner rotation",
       "description": "chill rotates the banner every 90s, normal every 40s, max every 20s.",
       "default": "normal",
-      "options": ["chill", "normal", "max"]
+      "options": [
+        "chill",
+        "normal",
+        "max"
+      ]
     },
     "theater": {
       "type": "string",
       "title": "Theater pane",
       "description": "on opens a pane beside the transcript during turns longer than a few seconds (fullscreen layout, 144+ columns). off never opens it.",
       "default": "on",
-      "options": ["on", "off"]
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "pictures": {
+      "type": "string",
+      "title": "Pictures",
+      "description": "on draws logos, Theater images and video ads. off keeps ads text only.",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
     }
   }
 }

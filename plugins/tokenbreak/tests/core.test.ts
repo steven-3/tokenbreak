@@ -10,29 +10,44 @@ import {
   parseBatch,
   pauseUntil,
   rotationMs,
-  STATUS_TEXT,
-  statusAdOf,
-  statusLine,
+  inkOn,
+  tint,
+  posterOf,
+  withoutFrames,
+  bannerStyleOf,
   theaterArt,
 } from '../hooks/core'
 import { BATCH } from './world'
 
 describe('core', () => {
-  test('the status line shows a Status Sponsor when the batch has one', () => {
-    const sponsor = {
-      id: 'status-1',
-      format: 'status' as const,
-      brand: 'Acme DB',
-      headline: 'Postgres that never pages you',
-      accent: '#FFE600',
-      clickUrl: 'https://example.com',
-      isHouse: false,
-    }
+  test('a Theater video parses, its rate held to 1-30 fps, and an empty or oversized one is dropped', () => {
+    const theater = { id: 'v', format: 'theater', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
+    const parse = (video: unknown) => parseBatch(JSON.stringify({ ads: [{ ...theater, video }] }))?.ads[0]?.video
 
-    expect(statusAdOf([...BATCH.ads, sponsor])?.id).toBe('status-1')
-    expect(statusLine(sponsor)).toBe('Ad · Acme DB: Postgres that never pages you')
-    expect(statusLine(undefined)).toBe(STATUS_TEXT)
-    expect(statusLine({ ...sponsor, headline: 'x'.repeat(120) }).length).toBe(72)
+    expect(parse({ frames: ['a', 'b'], fps: 120, width: 4, height: 3 })).toEqual({ frames: ['a', 'b'], fps: 30, width: 4, height: 3 })
+    expect(parse({ frames: [], fps: 12, width: 4, height: 3 })).toBeUndefined()
+    expect(parse({ frames: Array(241).fill('a'), fps: 12, width: 4, height: 3 })).toBeUndefined()
+    expect(parse({ frames: ['a', 3], fps: 12, width: 4, height: 3 })).toBeUndefined()
+  })
+
+  test('session state holds video ads without their frames', () => {
+    const video = { frames: ['a', 'b', 'c', 'd'], fps: 10, width: 4, height: 3 }
+    const ad = { id: 'v', format: 'theater' as const, brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev', isHouse: false, video }
+
+    expect(withoutFrames([ad])[0]?.video).toEqual({ frames: [], fps: 10, width: 4, height: 3 })
+    expect(ad.video.frames).toHaveLength(4)
+    expect(posterOf(40)).toBe(30)
+  })
+
+  test('call-to-action ink reads on its color, and unknown styles fall back to pill', () => {
+    expect(inkOn('#FFFFFF')).toBe('#141414')
+    expect(inkOn('#95BF47')).toBe('#141414')
+    expect(inkOn('#635BFF')).toBe('#FFFFFF')
+    expect(tint('#FFFFFF', 0.22)).toBe('#484848')
+    expect(tint('#3FCF8E', 0)).toBe('#141414')
+    expect(tint('#3FCF8E', 1)).toBe('#3fcf8e')
+    expect(bannerStyleOf('card')).toBe('card')
+    expect(bannerStyleOf('neon')).toBe('pill')
   })
 
   test('rotation follows the frequency option, normal by default', () => {
