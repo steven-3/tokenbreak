@@ -1,6 +1,6 @@
 {
   "name": "tokenbreak",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Opt-in ads for Claude Code: a banner above the prompt and a Theater pane while Claude works. Unofficial, not affiliated with Anthropic.",
   "author": {
     "name": "Tokenbreak"

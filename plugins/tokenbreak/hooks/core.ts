@@ -135,16 +135,21 @@ function videoOf(raw: unknown): AdVideo | undefined {
   return { frames: frames as string[], fps: Math.min(30, Math.max(1, video.fps)), width: video.width, height: video.height }
 }
 
-/** A server ad's sound: an https URL only; a server may not name the plugin's files. */
-function audioOf(raw: unknown): AdAudio | undefined {
+/**
+ * A server ad's sound: a URL on the ad server itself (`mediaOrigin`), never a
+ * third party's. The engine fetches it from the person's machine, so any other
+ * host would see their IP each time an ad played (a tracking pixel) or could be
+ * a host on their local network. A server may not name the plugin's files either.
+ */
+function audioOf(raw: unknown, mediaOrigin: string | undefined): AdAudio | undefined {
   const url = (raw as { url?: unknown } | undefined)?.url
 
-  if (typeof url !== 'string' || url.length > 2048) {
+  if (mediaOrigin === undefined || typeof url !== 'string' || url.length > 2048) {
     return undefined
   }
 
   try {
-    return new URL(url).protocol === 'https:' ? { url } : undefined
+    return new URL(url).origin === mediaOrigin ? { url } : undefined
   } catch {
     return undefined
   }
@@ -152,7 +157,7 @@ function audioOf(raw: unknown): AdAudio | undefined {
 
 const isFormat = (value: unknown): value is AdFormat => value === 'banner' || value === 'theater'
 
-function adOf(raw: unknown): Ad | undefined {
+function adOf(raw: unknown, mediaOrigin: string | undefined): Ad | undefined {
   if (typeof raw !== 'object' || raw === null) {
     return undefined
   }
@@ -168,7 +173,7 @@ function adOf(raw: unknown): Ad | undefined {
         return cut === undefined ? [] : [cut]
       })
     : []
-  const audio = audioOf(ad.audio)
+  const audio = audioOf(ad.audio, mediaOrigin)
   const logo = ad.logo as Record<string, unknown> | undefined
   const hasLogo = isImage(logo, LOGO_MAX_BYTES)
 
@@ -202,8 +207,12 @@ function adOf(raw: unknown): Ad | undefined {
   }
 }
 
-/** An `AdBatch` from the API's JSON, its malformed ads dropped; undefined when it isn't one. */
-export function parseBatch(text: string): AdBatch | undefined {
+/**
+ * An `AdBatch` from the API's JSON, its malformed ads dropped; undefined when it
+ * isn't one. Ad sound is kept only when it's served from `mediaOrigin`, the ad
+ * server's own origin; without one, no sound is kept.
+ */
+export function parseBatch(text: string, mediaOrigin?: string): AdBatch | undefined {
   try {
     const raw = JSON.parse(text) as Record<string, unknown>
 
@@ -211,7 +220,7 @@ export function parseBatch(text: string): AdBatch | undefined {
       return undefined
     }
 
-    const ads = raw.ads.map(adOf).filter((ad): ad is Ad => ad !== undefined)
+    const ads = raw.ads.map(one => adOf(one, mediaOrigin)).filter((ad): ad is Ad => ad !== undefined)
     const ttl = typeof raw.ttlSeconds === 'number' && raw.ttlSeconds > 0 ? raw.ttlSeconds : 600
 
     return { ads, ttlSeconds: Math.min(ttl, 24 * 3600), servedAt: typeof raw.servedAt === 'string' ? raw.servedAt : '' }

@@ -56,22 +56,25 @@ describe('core', () => {
     expect(Math.abs(only.columns / only.rows - (16 / 9) * 2)).toBeLessThan(0.2)
   })
 
-  test('a server ad may carry video cuts and https sound, but never local files', () => {
+  test('a server ad may carry video cuts and sound from the ad server, but never local files or other hosts', () => {
     const theater = { id: 't', format: 'theater', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
     const cut = { frames: ['a', 'b'], fps: 15, width: 9, height: 16, files: ['/etc/passwd'] }
+    const server = 'https://tokenbreak.dev'
+    const withAudio = (audio: unknown) => parseBatch(JSON.stringify({ ads: [{ ...theater, audio }] }), server)?.ads[0]?.audio
     const ad = parseBatch(
-      JSON.stringify({ ads: [{ ...theater, videos: [cut, cut, cut, cut], audio: { url: 'https://cdn.a.dev/s.m4a' } }] }),
+      JSON.stringify({ ads: [{ ...theater, videos: [cut, cut, cut, cut], audio: { url: `${server}/m/s.m4a` } }] }),
+      server,
     )?.ads[0]
 
     expect(ad?.videos).toHaveLength(3)
     expect(ad?.videos?.[0]?.files).toBeUndefined()
-    expect(ad?.audio).toEqual({ url: 'https://cdn.a.dev/s.m4a' })
-
-    const local = parseBatch(JSON.stringify({ ads: [{ ...theater, audio: { asset: 'hooks/register.tsx' } }] }))?.ads[0]
-    const plain = parseBatch(JSON.stringify({ ads: [{ ...theater, audio: { url: 'http://a.dev/s.m4a' } }] }))?.ads[0]
-
-    expect(local?.audio).toBeUndefined()
-    expect(plain?.audio).toBeUndefined()
+    expect(ad?.audio).toEqual({ url: `${server}/m/s.m4a` })
+    // An advertiser's own host would see each viewer's IP: a tracking pixel by another name.
+    expect(withAudio({ url: 'https://tracker.example/s.m4a' })).toBeUndefined()
+    expect(withAudio({ url: 'https://192.168.1.10/s.m4a' })).toBeUndefined()
+    expect(withAudio({ asset: 'hooks/register.tsx' })).toBeUndefined()
+    // Without a known ad server, no sound at all.
+    expect(parseBatch(JSON.stringify({ ads: [{ ...theater, audio: { url: `${server}/m/s.m4a` } }] }))?.ads[0]?.audio).toBeUndefined()
   })
 
   test('a banner logo is kept only within its tiny budget', () => {

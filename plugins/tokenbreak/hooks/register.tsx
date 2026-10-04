@@ -122,6 +122,15 @@ async function showAds($: EngineInterface, list: readonly Ad[]) {
   await update($, ads, () => withoutFrames(list))
 }
 
+/** The ad server's origin, the only host ad sound may come from. */
+function originOf(endpoint: string): string | undefined {
+  try {
+    return new URL(endpoint).origin
+  } catch {
+    return undefined
+  }
+}
+
 const frameKey = (adId: string, cut: number) => `${adId}#${cut}`
 
 /** How many frames a cut has: files the terminal reads, or PNGs held in memory. */
@@ -177,7 +186,7 @@ async function refresh($: EngineInterface) {
     const response = await $.http.fetch(`${run.endpoint}/api/v1/ads?formats=${FORMATS.join(',')}`, {
       headers: { accept: 'application/json' },
     })
-    const batch = response.ok ? parseBatch(response.text) : undefined
+    const batch = response.ok ? parseBatch(response.text, originOf(run.endpoint)) : undefined
 
     if (batch !== undefined && batch.ads.length > 0) {
       run.fetchedAt = await $.clock.now()
@@ -441,7 +450,7 @@ async function startSession($: EngineInterface) {
     await $.store.set('deviceId', run.deviceId)
   }
 
-  const cached = parseBatch(JSON.stringify((await $.store.get('batch')) ?? null))
+  const cached = parseBatch(JSON.stringify((await $.store.get('batch')) ?? null), originOf(run.endpoint))
   const storedStyle = await $.store.get('bannerStyle')
 
   if (cached !== undefined && cached.ads.length > 0) {
