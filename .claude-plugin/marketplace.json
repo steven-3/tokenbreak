@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Tokenbreak for Claude Code: opt-in ads in the terminal. Unofficial, not affiliated with Anthropic.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "tokenbreak",
       "description": "Opt-in ads for Claude Code: a banner above the prompt and a Theater pane while Claude works. Ads never enter the model's context. Unofficial, not affiliated with Anthropic.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "Tokenbreak"
       },

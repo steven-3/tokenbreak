@@ -13,6 +13,7 @@ import {
   inkOn,
   tint,
   posterOf,
+  theaterLayout,
   withoutFrames,
   bannerStyleOf,
   theaterArt,
@@ -37,6 +38,50 @@ describe('core', () => {
     expect(withoutFrames([ad])[0]?.video).toEqual({ frames: [], fps: 10, width: 4, height: 3 })
     expect(ad.video.frames).toHaveLength(4)
     expect(posterOf(40)).toBe(30)
+  })
+
+  test('the Theater picks the cut and arrangement with the biggest picture', () => {
+    const shapes = [
+      { width: 1080, height: 1920 },
+      { width: 1920, height: 1080 },
+    ]
+
+    // A tall, narrow pane: the vertical cut, stacked over the card.
+    expect(theaterLayout(70, 80, shapes)).toMatchObject({ mode: 'stack', shape: 0, columns: 70 })
+    // A wide, short pane: the landscape cut beside the card.
+    expect(theaterLayout(150, 30, shapes)).toMatchObject({ mode: 'side', shape: 1, rows: 29 })
+    // One shape only: it is still fitted without distortion.
+    const only = theaterLayout(70, 80, [shapes[1] as { width: number; height: number }])
+
+    expect(Math.abs(only.columns / only.rows - (16 / 9) * 2)).toBeLessThan(0.2)
+  })
+
+  test('a server ad may carry video cuts and https sound, but never local files', () => {
+    const theater = { id: 't', format: 'theater', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
+    const cut = { frames: ['a', 'b'], fps: 15, width: 9, height: 16, files: ['/etc/passwd'] }
+    const ad = parseBatch(
+      JSON.stringify({ ads: [{ ...theater, videos: [cut, cut, cut, cut], audio: { url: 'https://cdn.a.dev/s.m4a' } }] }),
+    )?.ads[0]
+
+    expect(ad?.videos).toHaveLength(3)
+    expect(ad?.videos?.[0]?.files).toBeUndefined()
+    expect(ad?.audio).toEqual({ url: 'https://cdn.a.dev/s.m4a' })
+
+    const local = parseBatch(JSON.stringify({ ads: [{ ...theater, audio: { asset: 'hooks/register.tsx' } }] }))?.ads[0]
+    const plain = parseBatch(JSON.stringify({ ads: [{ ...theater, audio: { url: 'http://a.dev/s.m4a' } }] }))?.ads[0]
+
+    expect(local?.audio).toBeUndefined()
+    expect(plain?.audio).toBeUndefined()
+  })
+
+  test('a banner logo is kept only within its tiny budget', () => {
+    const banner = { id: 'b', format: 'banner', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
+    const logo = (bytes: number) => ({ png: 'A'.repeat(Math.ceil(bytes / 3) * 4), width: 36, height: 36 })
+    const parse = (bytes: number) => parseBatch(JSON.stringify({ ads: [{ ...banner, logo: logo(bytes) }] }))?.ads[0]?.logo
+
+    expect(parse(400)).toBeDefined()
+    expect(parse(768)).toBeDefined()
+    expect(parse(3000)).toBeUndefined()
   })
 
   test('call-to-action ink reads on its color, and unknown styles fall back to pill', () => {

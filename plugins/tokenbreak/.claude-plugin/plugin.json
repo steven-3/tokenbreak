@@ -1,6 +1,6 @@
 {
   "name": "tokenbreak",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Opt-in ads for Claude Code: a banner above the prompt and a Theater pane while Claude works. Unofficial, not affiliated with Anthropic.",
   "author": {
     "name": "Tokenbreak"
@@ -39,7 +39,17 @@
     "pictures": {
       "type": "string",
       "title": "Pictures",
-      "description": "on draws logos, Theater images and video ads. off keeps ads text only.",
+      "description": "on draws banner logos, Theater images and video ads. off keeps ads text only.",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "sound": {
+      "type": "string",
+      "title": "Theater sound",
+      "description": "on plays a video ad's sound when the Theater opens (macOS); the mute button silences it and stays muted until you unmute. off keeps ads silent unless you press the sound button.",
       "default": "on",
       "options": [
         "on",

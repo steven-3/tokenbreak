@@ -1,4 +1,4 @@
-import type { Ad, AdBatch, AdFormat, AdVideo, BannerStyle, Impression } from '../types'
+import type { Ad, AdAudio, AdBatch, AdFormat, AdVideo, BannerStyle, Impression } from '../types'
 
 export const THEATER_PANE = 'tokenbreak-theater'
 export const QUEUE_CAP = 200
@@ -63,6 +63,9 @@ export const HOUSE_ADS: readonly Ad[] = [
 ]
 
 const HEX = /^#[0-9a-fA-F]{6}$/
+
+/** The most a banner logo's PNG may weigh; a bigger one draws the glyph instead. */
+export const LOGO_MAX_BYTES = 768
 
 export const isHex = (value: unknown): value is string => typeof value === 'string' && HEX.test(value)
 
@@ -132,6 +135,21 @@ function videoOf(raw: unknown): AdVideo | undefined {
   return { frames: frames as string[], fps: Math.min(30, Math.max(1, video.fps)), width: video.width, height: video.height }
 }
 
+/** A server ad's sound: an https URL only; a server may not name the plugin's files. */
+function audioOf(raw: unknown): AdAudio | undefined {
+  const url = (raw as { url?: unknown } | undefined)?.url
+
+  if (typeof url !== 'string' || url.length > 2048) {
+    return undefined
+  }
+
+  try {
+    return new URL(url).protocol === 'https:' ? { url } : undefined
+  } catch {
+    return undefined
+  }
+}
+
 const isFormat = (value: unknown): value is AdFormat => value === 'banner' || value === 'theater'
 
 function adOf(raw: unknown): Ad | undefined {
@@ -142,9 +160,17 @@ function adOf(raw: unknown): Ad | undefined {
   const ad = raw as Record<string, unknown>
   const image = ad.image as Record<string, unknown> | undefined
   const hasImage = isImage(image, 2 * 1024 * 1024)
-  const logo = ad.logo as Record<string, unknown> | undefined
-  const hasLogo = isImage(logo, 64 * 1024)
   const video = videoOf(ad.video)
+  const videos = Array.isArray(ad.videos)
+    ? ad.videos.slice(0, 3).flatMap(one => {
+        const cut = videoOf(one)
+
+        return cut === undefined ? [] : [cut]
+      })
+    : []
+  const audio = audioOf(ad.audio)
+  const logo = ad.logo as Record<string, unknown> | undefined
+  const hasLogo = isImage(logo, LOGO_MAX_BYTES)
 
   if (
     typeof ad.id !== 'string' ||
@@ -169,9 +195,9 @@ function adOf(raw: unknown): Ad | undefined {
       image: { png: image.png as string, width: image.width as number, height: image.height as number },
     }),
     ...(video !== undefined && { video }),
-    ...(hasLogo && {
-      logo: { png: logo.png as string, width: logo.width as number, height: logo.height as number },
-    }),
+    ...(videos.length > 0 && { videos }),
+    ...(audio !== undefined && { audio }),
+    ...(hasLogo && { logo: { png: logo.png as string, width: logo.width as number, height: logo.height as number } }),
     isHouse: ad.isHouse === true,
   }
 }
@@ -208,7 +234,55 @@ export const bannersOf = (ads: readonly Ad[]) => ads.filter(ad => ad.format === 
  * rate kept. A session's state takes 4 MiB of JSON; one video's frames can fill that.
  */
 export const withoutFrames = (ads: readonly Ad[]): Ad[] =>
-  ads.map(ad => (ad.video === undefined ? ad : { ...ad, video: { ...ad.video, frames: [] } }))
+  ads.map(ad => ({
+    ...ad,
+    ...(ad.video !== undefined && { video: { ...ad.video, frames: [] } }),
+    ...(ad.videos !== undefined && { videos: ad.videos.map(cut => ({ ...cut, frames: [] })) }),
+  }))
+
+/** Every cut of an ad's video: `videos` first, then `video`. */
+export const cutsOf = (ad: Ad): AdVideo[] => [...(ad.videos ?? []), ...(ad.video === undefined ? [] : [ad.video])]
+
+/** A terminal cell is about twice as tall as it is wide. */
+export const CELL_ASPECT = 2
+
+/** Rows the Theater card takes under a picture, and columns beside one. */
+export const CARD_ROWS = 9
+export const CARD_COLUMNS = 36
+
+export type TheaterLayout = {
+  /** `stack`: picture above the card; `side`: picture left of it. */
+  mode: 'stack' | 'side'
+  /** Which of the shapes it shows. */
+  shape: number
+  columns: number
+  rows: number
+}
+
+/**
+ * The layout that shows the biggest picture in a `columns` × `rows` pane: every
+ * shape, stacked over the card or beside it, fitted without distortion.
+ */
+export function theaterLayout(
+  columns: number,
+  rows: number,
+  shapes: readonly { width: number; height: number }[],
+): TheaterLayout {
+  const fit = (mode: TheaterLayout['mode'], shape: number, roomColumns: number, roomRows: number): TheaterLayout => {
+    const { width, height } = shapes[shape] ?? { width: 16, height: 9 }
+    // Cells across per cell down that keep the picture's own proportions.
+    const ratio = (width / height) * CELL_ASPECT
+    const across = Math.max(1, Math.min(255, roomColumns, Math.floor(Math.max(1, roomRows) * ratio)))
+
+    return { mode, shape, columns: across, rows: Math.max(1, Math.min(255, Math.round(across / ratio))) }
+  }
+  const options = (shapes.length === 0 ? [0] : shapes.map((_, at) => at)).flatMap(shape => [
+    fit('stack', shape, columns, rows - CARD_ROWS),
+    ...(columns - CARD_COLUMNS >= 20 ? [fit('side', shape, columns - CARD_COLUMNS - 2, rows - 1)] : []),
+  ])
+
+  return options.reduce((best, one) => (one.columns * one.rows > best.columns * best.rows ? one : best))
+}
 
 /** The frame a video shows before it plays: three quarters in, past any fade-in. */
 export const posterOf = (frameCount: number) => Math.floor(frameCount * 0.75)

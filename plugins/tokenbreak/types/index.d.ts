@@ -13,22 +13,34 @@ export type AdImage = {
   height: number
 }
 
-/** A short silent loop, as PNG frames played in order. */
+/** A short loop, as PNG frames played in order. */
 export type AdVideo = {
   /** Whole PNGs, base64, all the same size. */
   frames: string[]
+  /**
+   * Built-in ads only: absolute paths of PNG files the terminal reads itself, in
+   * place of `frames`. Never taken from the ad server, which may not name files.
+   */
+  files?: string[]
   /** Frames a second, 1 to 30. */
   fps: number
   width: number
   height: number
 }
 
+/** An ad's sound: a URL the engine fetches, or (built-in ads only) a file the plugin ships. */
+export type AdAudio = { url: string } | { asset: string }
+
 export type Ad = {
   id: string
   format: AdFormat
   brand: string
   glyph?: string
-  /** Banner only: a square brand mark drawn in two cells before the brand, where the terminal shows pictures; else `glyph`. */
+  /**
+   * Banner only: the brand's mark as a tiny PNG (36x36, at most 768 bytes), drawn in
+   * two cells. Kept tiny on purpose: a picture's data can be cut off mid-send while
+   * the screen redraws and spill out as text, and a small one goes in one short piece.
+   */
   logo?: AdImage
   headline: string
   /** Banner only: the button's words (`Start free`); `Learn more` when absent. */
@@ -41,6 +53,10 @@ export type Ad = {
   image?: AdImage
   /** Theater only: plays in place of `image` where the terminal shows pictures. */
   video?: AdVideo
+  /** Theater only: cuts of the video in other shapes (9:16, 16:9, 1:1); the Theater plays the one that fills its pane best. */
+  videos?: AdVideo[]
+  /** Theater only: the video's sound, played only when the person presses the sound button. */
+  audio?: AdAudio
   isHouse: boolean
 }
 
@@ -85,6 +101,7 @@ declare module 'claude-code' {
       pausedUntil: number | null
       theater: TheaterShowing | null
       bannerStyle: BannerStyle
+      theaterSound: boolean
     }
   }
 }

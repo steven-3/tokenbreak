@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
+import type { EngineInterface, ImageSource, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { Ad, AdSource, BannerStyle, Impression, TheaterShowing } from '../types'
+import type { Ad, AdSource, AdVideo, BannerStyle, Impression, TheaterShowing } from '../types'
 import {
   BANNER_STYLES,
   bannerStyleOf,
@@ -9,6 +9,7 @@ import {
   canDockTheater,
   capQueue,
   currentBanner,
+  cutsOf,
   describeWait,
   FLUSH_AT,
   FLUSH_EVERY_MS,
@@ -28,6 +29,7 @@ import {
   THEATER_PANE,
   THEATER_SNOOZE_MS,
   theaterArt,
+  theaterLayout,
   theaterOf,
   withoutFrames,
   type Seen,
@@ -44,6 +46,7 @@ const bannerIndex = atom({ plugin: 'tokenbreak', key: 'bannerIndex' } as const, 
 const pausedUntil = atom({ plugin: 'tokenbreak', key: 'pausedUntil' } as const, null as number | null)
 const theater = atom({ plugin: 'tokenbreak', key: 'theater' } as const, null as TheaterShowing | null)
 const bannerStyle = atom({ plugin: 'tokenbreak', key: 'bannerStyle' } as const, 'pill' as BannerStyle)
+const theaterSound = atom({ plugin: 'tokenbreak', key: 'theaterSound' } as const, false)
 
 const FALLBACK_ACCENT = '#FFE600'
 
@@ -51,8 +54,10 @@ const FALLBACK_ACCENT = '#FFE600'
 type Run = {
   endpoint: string
   isTheaterOn: boolean
-  /** Whether ads draw pictures (logos, Theater images, video): the `pictures` option. */
+  /** Whether ads draw pictures (banner logos, Theater images and video): the `pictures` option. */
   arePicturesOn: boolean
+  /** Whether a video ad's sound plays when the Theater opens: the `sound` option. */
+  isSoundOnByDefault: boolean
   rotationMs: number
   deviceId: string
   fetchedAt: number
@@ -69,8 +74,14 @@ type Run = {
   drawnBanner?: string
   /** Why the Theater last opened or stayed shut, for `/ads status`. */
   theaterNote: string
-  /** Each video ad's frames by ad id; `$.state` holds the ads without them. */
+  /** Each video cut's frames by `frameKey`; `$.state` holds the ads without them. */
   frames: Map<string, readonly string[]>
+  /** The cut the Theater drew last, which playback steps through. */
+  drawnCut?: { adId: string; index: number }
+  /** The frame on screen; -1 restarts the loop on the next tick. */
+  frame?: number
+  /** Stops the Theater's sound; set while it plays. */
+  sound?: AbortController
   /** Plays the Theater's video while the pane is open. */
   videoTimer?: Timer
   /** The last video's frame swaps, for `/ads status`. */
@@ -83,6 +94,7 @@ function runOf(options: PluginOptions): Run {
     endpoint: String(options.endpoint ?? 'https://tokenbreak.dev').replace(/\/+$/, ''),
     isTheaterOn: options.theater !== 'off',
     arePicturesOn: options.pictures !== 'off',
+    isSoundOnByDefault: options.sound !== 'off',
     rotationMs: rotationMs(options.frequency),
     deviceId: '',
     fetchedAt: 0,
@@ -102,11 +114,34 @@ let run: Run = runOf({})
 /** The status line stays empty; an older build may have left a line there. */
 /** Puts `list` on screen: frames into module memory, the rest into `$.state`. */
 async function showAds($: EngineInterface, list: readonly Ad[]) {
-  run.frames = new Map(list.flatMap(ad => (ad.video === undefined ? [] : [[ad.id, ad.video.frames] as const])))
+  run.frames = new Map(
+    list.flatMap(ad =>
+      cutsOf(ad).flatMap((cut, at) => (cut.frames.length === 0 ? [] : [[frameKey(ad.id, at), cut.frames] as const])),
+    ),
+  )
   await update($, ads, () => withoutFrames(list))
 }
 
-const framesOf = (ad: Ad) => run.frames.get(ad.id) ?? []
+const frameKey = (adId: string, cut: number) => `${adId}#${cut}`
+
+/** How many frames a cut has: files the terminal reads, or PNGs held in memory. */
+const lengthOf = (ad: Ad, cut: number) =>
+  cutsOf(ad)[cut]?.files?.length ?? run.frames.get(frameKey(ad.id, cut))?.length ?? 0
+
+/** One frame of a cut as an Image source, undefined when the cut has none. */
+function frameSource(ad: Ad, cut: number, frame: number): ImageSource | undefined {
+  const file = cutsOf(ad)[cut]?.files?.[frame]
+
+  if (file !== undefined) {
+    return { file, format: 'png' }
+  }
+
+  const png = run.frames.get(frameKey(ad.id, cut))?.[frame]
+
+  return png === undefined ? undefined : { png }
+}
+
+const hasVideo = (ad: Ad) => cutsOf(ad).some((_, at) => lengthOf(ad, at) > 0)
 
 async function showStatus($: EngineInterface) {
   $.ui.status(undefined)
@@ -269,33 +304,51 @@ async function openTheater($: EngineInterface, turnId: string) {
 
   await update($, theater, () => ({ adId: ad.id, turnId, isPlaced: true }))
   run.theaterNote = `opened ${ad.brand}${
-    framesOf(ad).length === 0
+    !hasVideo(ad)
       ? ''
       : arePicturesOn()
-        ? ` (video, ${framesOf(ad).length} frames)`
+        ? ` (video, ${cutsOf(ad).length} cut${cutsOf(ad).length === 1 ? '' : 's'}, ${lengthOf(ad, 0)} frames)`
         : ' (text only: pictures are off in /config)'
   }`
   playVideo($, ad)
+
+  // Sound starts with the picture unless the person muted it once (`muted` in the store,
+  // kept across sessions) or set `sound` to off.
+  if (ad.audio !== undefined && run.isSoundOnByDefault && arePicturesOn() && (await $.store.get('muted')) !== true) {
+    await startSound($, ad)
+  }
 }
 
-/** Steps the Theater's Image through the ad's frames until `stopVideo`. */
+/** Steps the Theater's Image through the cut it drew, until `stopVideo`. */
 function playVideo($: EngineInterface, ad: Ad) {
   stopVideo()
 
-  const video = ad.video
-  const frames = framesOf(ad)
+  const fps = Math.max(0, ...cutsOf(ad).map((cut: AdVideo) => cut.fps))
 
-  if (video === undefined || frames.length < 2 || !arePicturesOn()) {
+  if (!hasVideo(ad) || fps === 0 || !arePicturesOn()) {
     return
   }
 
-  let frame = posterOf(frames.length)
-
   run.video = { swapped: 0, refused: 0 }
-  run.videoTimer = $.clock.every(Math.round(1000 / video.fps), () => {
-    frame = (frame + 1) % frames.length
+  run.frame = undefined
+  run.videoTimer = $.clock.every(Math.round(1000 / fps), () => {
+    const drawn = run.drawnCut
+    const length = drawn?.adId === ad.id ? lengthOf(ad, drawn.index) : 0
+
+    if (drawn === undefined || length < 2) {
+      return
+    }
+
+    run.frame = ((run.frame ?? posterOf(length)) + 1) % length
+
+    const source = frameSource(ad, drawn.index, run.frame)
+
+    if (source === undefined) {
+      return
+    }
+
     void $.ui
-      .blit({ requestId: THEATER_PANE, key: 'theater-image', source: { png: frames[frame] ?? '' } })
+      .blit({ requestId: THEATER_PANE, key: 'theater-image', source })
       .then(result => {
         if (result.deny === undefined) {
           run.video.swapped += 1
@@ -318,12 +371,58 @@ function stopVideo() {
   run.videoTimer = undefined
 }
 
+/** The sound button: mutes (and remembers it), or unmutes and plays from the top of the loop. */
+async function toggleSound($: EngineInterface, ad: Ad) {
+  if (run.sound !== undefined) {
+    await stopSound($)
+    await $.store.set('muted', true)
+
+    return
+  }
+
+  await $.store.delete('muted')
+  await startSound($, ad)
+}
+
+/** Plays the ad's sound, looping with the picture, until `stopSound`. */
+async function startSound($: EngineInterface, ad: Ad) {
+  const audio = ad.audio
+
+  if (audio === undefined) {
+    return
+  }
+
+  const controller = new AbortController()
+
+  run.sound = controller
+  run.frame = -1
+  await update($, theaterSound, () => true)
+  void $.audio
+    .play('url' in audio ? { url: audio.url } : { asset: audio.asset }, { shouldLoop: true, signal: controller.signal })
+    .catch((error: unknown) => {
+      run.theaterNote = `${run.theaterNote}; sound failed: ${String(error).slice(0, 120)}`
+    })
+    .finally(() => {
+      if (run.sound === controller) {
+        run.sound = undefined
+        void update($, theaterSound, () => false)
+      }
+    })
+}
+
+async function stopSound($: EngineInterface) {
+  run.sound?.abort()
+  run.sound = undefined
+  await update($, theaterSound, () => false)
+}
+
 async function startSession($: EngineInterface) {
   for (const timer of run.timers.splice(0)) {
     timer.cancel()
   }
 
   stopVideo()
+  await stopSound($)
 
   await $.command
     .register({
@@ -455,6 +554,7 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
 
 async function closeTurn($: EngineInterface, turnId: string) {
   stopVideo()
+  await stopSound($)
   run.runningTurn = undefined
   run.theaterTimer?.cancel()
   run.theaterTimer = undefined
@@ -525,16 +625,16 @@ export const register: Register = (on, options) => {
     run.drawnBanner = ad.id
 
     const { Box, Text, Link, Button } = $.ui.resolve(e)
-    // Only the terminal draws pictures; elsewhere the glyph stands in for the logo.
     const Image = e.surface === 'terminal' && arePicturesOn() ? $.ui.resolve(e).Image : undefined
     const style = await read($, bannerStyle)
     const href = linkable(ad.clickUrl)
     const accent = isHex(ad.accent) ? ad.accent : FALLBACK_ACCENT
-    const logo = Image === undefined ? undefined : ad.logo
     const cta = ad.cta ?? 'Learn more'
+    // A logo only within LOGO_MAX_BYTES (parseBatch drops bigger ones): the band redraws
+    // constantly, and a small picture goes in one short piece that a redraw can't cut.
     const mark =
-      logo !== undefined && Image !== undefined ? (
-        <Image key="banner-logo" source={{ png: logo.png }} columns={2} rows={1} alt={ad.glyph ?? ' '} />
+      Image !== undefined && ad.logo !== undefined ? (
+        <Image key="banner-logo" source={{ png: ad.logo.png }} columns={2} rows={1} alt={ad.glyph ?? ' '} />
       ) : (
         <Text color={accent}>{ad.glyph ?? '●'}</Text>
       )
@@ -594,11 +694,11 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: 'tokenbreak-theater' }, async ($, e) => {
     const showing = await read($, theater)
     const list = await read($, ads)
+    const isSoundOn = await read($, theaterSound)
     const ad = list.find(one => one.id === showing?.adId) ?? theaterOf(list)
     const href = linkable(ad.clickUrl)
     const accent = isHex(ad.accent) ? ad.accent : FALLBACK_ACCENT
-    const width = Math.max(10, Math.min(e.props.bodyColumns - 2, 72))
-    const { Box, Text, Link } = $.ui.resolve(e)
+    const { Box, Text, Link, Button } = $.ui.resolve(e)
     const isTextOnly = e.surface !== 'terminal' || !arePicturesOn()
     // The same parts as the banner: brand in its color, a dim label, a button in the brand's color.
     const card = (
@@ -610,43 +710,68 @@ export const register: Register = (on, options) => {
           <Text dimColor>sponsored</Text>
         </Box>
         <Text>{ad.headline}</Text>
-        {href !== undefined && (
-          <Link href={href}>
-            <Text backgroundColor={tint(accent, 0.22)} color={accent} bold>
-              {` ${ad.cta ?? 'Learn more'} ↗ `}
-            </Text>
-          </Link>
-        )}
+        <Box flexDirection="row" gap={2}>
+          {href !== undefined && (
+            <Link href={href}>
+              <Text backgroundColor={tint(accent, 0.22)} color={accent} bold>
+                {` ${ad.cta ?? 'Learn more'} ↗ `}
+              </Text>
+            </Link>
+          )}
+          {ad.audio !== undefined && (
+            // Mutes or unmutes; a mute is remembered. Sound always stops when the pane closes.
+            <Button
+              key="sound"
+              label={isSoundOn ? '🔊 mute' : '🔇 sound'}
+              plain
+              dimColor={!isSoundOn}
+              onPress={() => void toggleSound($, ad)}
+            />
+          )}
+        </Box>
         <Text dimColor>Closes when Claude finishes · /ads pause hides ads</Text>
       </Box>
     )
 
     if (isTextOnly || e.surface !== 'terminal') {
+      run.drawnCut = undefined
+
       return card
     }
 
     const { Image } = $.ui.resolve(e)
-    const frames = framesOf(ad)
-    // A video starts on its poster frame; playVideo swaps the rest in.
-    const picture =
-      ad.video !== undefined && frames.length > 0
-        ? { png: frames[posterOf(frames.length)] ?? '', width: ad.video.width, height: ad.video.height }
-        : ad.image
-    const art = picture === undefined ? theaterArt() : undefined
-    const pixelsWide = picture?.width ?? art?.width ?? 16
-    const pixelsHigh = picture?.height ?? art?.height ?? 9
-    // A cell is about twice as tall as it is wide.
-    const rows = Math.max(3, Math.min(255, Math.round((width * pixelsHigh) / pixelsWide / 2)))
+    const cuts = hasVideo(ad) ? cutsOf(ad) : []
+    const art = cuts.length === 0 && ad.image === undefined ? theaterArt() : undefined
+    const shapes =
+      cuts.length > 0
+        ? cuts.map(cut => ({ width: cut.width, height: cut.height }))
+        : [{ width: ad.image?.width ?? art?.width ?? 16, height: ad.image?.height ?? art?.height ?? 9 }]
+    // The cut and arrangement that show the biggest picture in this pane, tall or wide.
+    const layout = theaterLayout(e.props.bodyColumns, e.props.scroll.bodyRows, shapes)
+    const length = cuts.length > 0 ? lengthOf(ad, layout.shape) : 0
 
-    return (
+    run.drawnCut = cuts.length > 0 ? { adId: ad.id, index: layout.shape } : undefined
+
+    // A video starts on its poster frame, or where playback is; playVideo swaps the rest in.
+    const source: ImageSource =
+      (length > 0 ? frameSource(ad, layout.shape, Math.max(0, run.frame ?? posterOf(length)) % length) : undefined) ??
+      (ad.image !== undefined ? { png: ad.image.png } : { rgba: art?.rgba ?? '', width: shapes[0]?.width ?? 16, height: shapes[0]?.height ?? 9 })
+    const picture = (
+      <Image key="theater-image" source={source} columns={layout.columns} rows={layout.rows} alt={`${ad.brand}: ${ad.headline}`} />
+    )
+
+    return layout.mode === 'side' ? (
+      <Box flexDirection="row" gap={2}>
+        {picture}
+        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+          {card}
+        </Box>
+      </Box>
+    ) : (
       <Box flexDirection="column" gap={1}>
-        <Image
-          key="theater-image"
-          source={picture !== undefined ? { png: picture.png } : { rgba: art?.rgba ?? '', width: pixelsWide, height: pixelsHigh }}
-          columns={Math.min(255, width)}
-          rows={rows}
-          alt={`${ad.brand}: ${ad.headline}`}
-        />
+        <Box flexDirection="row" justifyContent="center">
+          {picture}
+        </Box>
         {card}
       </Box>
     )
@@ -674,6 +799,7 @@ export const register: Register = (on, options) => {
 
   on('ui.close', { id: 'tokenbreak-theater' }, async ($, e, next) => {
     stopVideo()
+    await stopSound($)
 
     if (e.origin.kind === 'person') {
       await snoozeTheater($)
