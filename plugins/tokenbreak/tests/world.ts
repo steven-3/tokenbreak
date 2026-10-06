@@ -1,4 +1,4 @@
-import type { CommandRunInput, On, RenderInput, TurnCompleteInput } from 'claude-code'
+import type { CommandRunInput, On, RenderInput, RenderSurface, TurnCompleteInput } from 'claude-code'
 
 import type { AdBatch } from '../types'
 
@@ -7,6 +7,12 @@ export const THEATER = 'tokenbreak-theater'
 export const START = 1_800_000_000_000
 
 export const SESSION = { surface: 'terminal' as const, isInteractive: true, cwd: '/work' }
+
+/** How the SDK starts a session, for `-p` and the desktop's Code tab alike. */
+export const HEADLESS = { surface: null, isInteractive: false, cwd: '/work' }
+
+/** The desktop app connecting to a session it started through the SDK. */
+export const DESKTOP = { surface: 'desktop' as const, clientId: 'desktop:default' }
 
 export const BAND: RenderInput<'AbovePrompt'> = {
   component: 'AbovePrompt',
@@ -107,6 +113,12 @@ export type WorldOptions = {
   unplaced?: number
   /** What the store holds at the start. */
   stored?: Readonly<Record<string, unknown>>
+  /** The release info the ad server sends with the batch. */
+  release?: { latest: string; min: string }
+  /** The status `POST /api/v1/impressions` answers when up; 200 unless set. */
+  ingestStatus?: number
+  /** What `$.session.surfaces()` answers: empty, as in a -p run or before the desktop attaches. */
+  surfaces?: readonly RenderSurface[]
 }
 
 /** The engine beneath the plugin, in memory: what it was asked to do, and the ad server's answers. */
@@ -142,14 +154,23 @@ export function worldOf(on: On, options: WorldOptions = {}): World {
 
     if (e.url.includes('/api/v1/ads')) {
       return isAdServerUp
-        ? { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(BATCH) } }
+        ? {
+            value: {
+              status: 200,
+              ok: true,
+              headers: {},
+              text: JSON.stringify(options.release === undefined ? BATCH : { ...BATCH, mod: options.release }),
+            },
+          }
         : { deny: 'ECONNREFUSED' }
     }
 
     return {
-      value: isIngestUp
-        ? { status: 200, ok: true, headers: {}, text: '{"accepted":1}' }
-        : { status: 503, ok: false, headers: {}, text: '' },
+      value: !isIngestUp
+        ? { status: 503, ok: false, headers: {}, text: '' }
+        : options.ingestStatus === 426
+          ? { status: 426, ok: false, headers: {}, text: '{"minVersion":"9.0.0","accepted":0}' }
+          : { status: 200, ok: true, headers: {}, text: '{"accepted":1}' },
     }
   })
 
@@ -185,6 +206,8 @@ export function worldOf(on: On, options: WorldOptions = {}): World {
 
   on('ui.render', () => ({ type: 'Text', children: [''] }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.attach', ($, e) => ({ clientId: e.clientId }))
+  on('session.surfaces', () => ({ value: options.surfaces ?? [] }))
   on('session.end', () => ({}) as never)
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))

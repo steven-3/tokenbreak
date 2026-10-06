@@ -13,6 +13,9 @@ import {
   inkOn,
   tint,
   posterOf,
+  compareVersions,
+  updateStateOf,
+  MOD_VERSION,
   theaterLayout,
   withoutFrames,
   bannerStyleOf,
@@ -85,6 +88,17 @@ describe('core', () => {
     expect(parse(400)).toBeDefined()
     expect(parse(768)).toBeDefined()
     expect(parse(3000)).toBeUndefined()
+  })
+
+  test('versions compare part by part, and the update state follows the server', () => {
+    expect(compareVersions('0.3.10', '0.3.9')).toBeGreaterThan(0)
+    expect(compareVersions('0.3.2', '0.3.2')).toBe(0)
+    expect(compareVersions('0.2.9', '0.3.0')).toBeLessThan(0)
+    expect(updateStateOf(undefined)).toEqual({ kind: 'current' })
+    expect(updateStateOf({ latest: MOD_VERSION, min: MOD_VERSION })).toEqual({ kind: 'current' })
+    expect(updateStateOf({ latest: '9.0.0', min: '0.0.1' })).toEqual({ kind: 'available', latest: '9.0.0' })
+    expect(updateStateOf({ latest: '9.0.0', min: '9.0.0' })).toEqual({ kind: 'required', latest: '9.0.0' })
+    expect(parseBatch(JSON.stringify({ ads: [], mod: { latest: 'x', min: '1.0.0' } }))?.mod).toBeUndefined()
   })
 
   test('call-to-action ink reads on its color, and unknown styles fall back to pill', () => {

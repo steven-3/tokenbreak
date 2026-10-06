@@ -1,4 +1,11 @@
-import type { Ad, AdAudio, AdBatch, AdFormat, AdVideo, BannerStyle, Impression } from '../types'
+import type { Ad, AdAudio, AdBatch, AdFormat, AdVideo, BannerStyle, Impression, ModRelease, UpdateState } from '../types'
+
+/**
+ * This build's version. A hooks module can't read its own plugin.json without
+ * reading a file, so it's written here too; tools/sync-public-mod.sh refuses to
+ * publish unless it equals plugin.json's and the server's MOD_LATEST_VERSION.
+ */
+export const MOD_VERSION = '0.3.2'
 
 export const THEATER_PANE = 'tokenbreak-theater'
 export const QUEUE_CAP = 200
@@ -155,6 +162,52 @@ function audioOf(raw: unknown, mediaOrigin: string | undefined): AdAudio | undef
   }
 }
 
+const VERSION = /^\d+\.\d+\.\d+$/
+
+/** `a` compared with `b`, part by part: negative when older, 0 when equal. */
+export function compareVersions(a: string, b: string): number {
+  const [x, y] = [a, b].map(version => version.split('.').map(part => Number.parseInt(part, 10) || 0))
+
+  for (let at = 0; at < 3; at++) {
+    const diff = (x?.[at] ?? 0) - (y?.[at] ?? 0)
+
+    if (diff !== 0) {
+      return diff
+    }
+  }
+
+  return 0
+}
+
+/** The server's release info, when it sent a well-formed one. */
+function releaseOf(raw: unknown): ModRelease | undefined {
+  const mod = raw as { latest?: unknown; min?: unknown } | undefined
+
+  return typeof mod?.latest === 'string' && typeof mod.min === 'string' && VERSION.test(mod.latest) && VERSION.test(mod.min)
+    ? { latest: mod.latest, min: mod.min }
+    : undefined
+}
+
+/** Where `version` stands against the server's releases; current when the server didn't say. */
+export function updateStateOf(release: ModRelease | undefined, version = MOD_VERSION): UpdateState {
+  if (release === undefined || compareVersions(version, release.latest) >= 0) {
+    return { kind: 'current' }
+  }
+
+  return compareVersions(version, release.min) < 0
+    ? { kind: 'required', latest: release.latest }
+    : { kind: 'available', latest: release.latest }
+}
+
+/** What `/ads update` prints: how to update now, and how never to fall behind again. */
+export const UPDATE_STEPS = [
+  'Update Tokenbreak:',
+  '  /plugin marketplace update tokenbreak',
+  '  /plugin update tokenbreak@tokenbreak',
+  '  /reload-plugins',
+  'Get updates automatically: /plugin → Marketplaces → tokenbreak → Enable auto-update.',
+].join('\n')
+
 const isFormat = (value: unknown): value is AdFormat => value === 'banner' || value === 'theater'
 
 function adOf(raw: unknown, mediaOrigin: string | undefined): Ad | undefined {
@@ -223,7 +276,14 @@ export function parseBatch(text: string, mediaOrigin?: string): AdBatch | undefi
     const ads = raw.ads.map(one => adOf(one, mediaOrigin)).filter((ad): ad is Ad => ad !== undefined)
     const ttl = typeof raw.ttlSeconds === 'number' && raw.ttlSeconds > 0 ? raw.ttlSeconds : 600
 
-    return { ads, ttlSeconds: Math.min(ttl, 24 * 3600), servedAt: typeof raw.servedAt === 'string' ? raw.servedAt : '' }
+    const mod = releaseOf(raw.mod)
+
+    return {
+      ads,
+      ttlSeconds: Math.min(ttl, 24 * 3600),
+      servedAt: typeof raw.servedAt === 'string' ? raw.servedAt : '',
+      ...(mod !== undefined && { mod }),
+    }
   } catch {
     return undefined
   }

@@ -60,11 +60,24 @@ export type Ad = {
   isHouse: boolean
 }
 
+/** The mod's newest release, and the oldest that still earns. */
+export type ModRelease = {
+  latest: string
+  min: string
+}
+
 export type AdBatch = {
   ads: Ad[]
   ttlSeconds: number
   servedAt: string
+  mod?: ModRelease
 }
+
+/** Where this build stands: current, an update out, or too old to earn. */
+export type UpdateState =
+  | { kind: 'current' }
+  | { kind: 'available'; latest: string }
+  | { kind: 'required'; latest: string }
 
 export type Impression = {
   adId: string
@@ -76,6 +89,8 @@ export type Impression = {
 
 export type ImpressionBatch = {
   deviceId: string
+  /** The reporting mod's version; the server credits nothing from one under its minimum. */
+  modVersion?: string
   impressions: Impression[]
 }
 
@@ -102,6 +117,7 @@ declare module 'claude-code' {
       theater: TheaterShowing | null
       bannerStyle: BannerStyle
       theaterSound: boolean
+      update: UpdateState
     }
   }
 }

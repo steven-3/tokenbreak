@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ImageSource, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { Ad, AdSource, AdVideo, BannerStyle, Impression, TheaterShowing } from '../types'
+import type { Ad, AdSource, AdVideo, BannerStyle, Impression, ModRelease, TheaterShowing, UpdateState } from '../types'
 import {
   BANNER_STYLES,
   bannerStyleOf,
@@ -18,7 +18,10 @@ import {
   impressionKey,
   isHex,
   tint,
+  UPDATE_STEPS,
+  updateStateOf,
   linkable,
+  MOD_VERSION,
   posterOf,
   parseBatch,
   pauseUntil,
@@ -47,12 +50,16 @@ const pausedUntil = atom({ plugin: 'tokenbreak', key: 'pausedUntil' } as const, 
 const theater = atom({ plugin: 'tokenbreak', key: 'theater' } as const, null as TheaterShowing | null)
 const bannerStyle = atom({ plugin: 'tokenbreak', key: 'bannerStyle' } as const, 'pill' as BannerStyle)
 const theaterSound = atom({ plugin: 'tokenbreak', key: 'theaterSound' } as const, false)
+const updateState = atom({ plugin: 'tokenbreak', key: 'update' } as const, { kind: 'current' } as UpdateState)
 
 const FALLBACK_ACCENT = '#FFE600'
+const AD_YELLOW = '#FFE600'
 
 /** The module's own bookkeeping, set afresh by `register`: a reload starts it over. */
 type Run = {
   endpoint: string
+  /** Whether `startSession` ran in this load: on a terminal's start, or once a surface attached. */
+  hasStarted: boolean
   isTheaterOn: boolean
   /** Whether ads draw pictures (banner logos, Theater images and video): the `pictures` option. */
   arePicturesOn: boolean
@@ -89,9 +96,17 @@ type Run = {
   timers: Timer[]
 }
 
+/** The ad server's base URL; a host typed without a scheme (`tokenbreak.dev`) gets `https://`. */
+function endpointOf(value: unknown): string {
+  const endpoint = String(value ?? 'https://tokenbreak.dev').trim().replace(/\/+$/, '')
+
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint) ? endpoint : `https://${endpoint}`
+}
+
 function runOf(options: PluginOptions): Run {
   return {
-    endpoint: String(options.endpoint ?? 'https://tokenbreak.dev').replace(/\/+$/, ''),
+    endpoint: endpointOf(options.endpoint),
+    hasStarted: false,
     isTheaterOn: options.theater !== 'off',
     arePicturesOn: options.pictures !== 'off',
     isSoundOnByDefault: options.sound !== 'off',
@@ -121,6 +136,29 @@ async function showAds($: EngineInterface, list: readonly Ad[]) {
   )
   await update($, ads, () => withoutFrames(list))
 }
+
+/**
+ * Takes in the server's release info: a mod too old to earn shows an update notice
+ * in place of ads and reports nothing; an update that's merely out gets one toast
+ * per version.
+ */
+async function applyRelease($: EngineInterface, release: ModRelease | undefined) {
+  const state = updateStateOf(release)
+
+  await update($, updateState, () => state)
+
+  if (state.kind !== 'current' && (await $.store.get('toldVersion')) !== state.latest) {
+    await $.store.set('toldVersion', state.latest)
+    $.ui.toast(
+      state.kind === 'required'
+        ? `Tokenbreak ${state.latest} is required to keep earning. /ads update shows how.`
+        : `Tokenbreak ${state.latest} is out. /ads update shows how to get it.`,
+      { timeoutMs: 8000 },
+    )
+  }
+}
+
+const isUpdateRequired = async ($: EngineInterface) => (await read($, updateState)).kind === 'required'
 
 /** The ad server's origin, the only host ad sound may come from. */
 function originOf(endpoint: string): string | undefined {
@@ -192,6 +230,7 @@ async function refresh($: EngineInterface) {
       run.fetchedAt = await $.clock.now()
       run.ttlMs = batch.ttlSeconds * 1000
       await showAds($, batch.ads)
+      await applyRelease($, batch.mod)
       await update($, source, () => 'server' as AdSource)
       await $.store.set('batch', cacheable(batch))
       await showStatus($)
@@ -221,8 +260,18 @@ async function flush($: EngineInterface) {
     const response = await $.http.fetch(`${run.endpoint}/api/v1/impressions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ deviceId: run.deviceId, impressions: sent }),
+      body: JSON.stringify({ deviceId: run.deviceId, modVersion: MOD_VERSION, impressions: sent }),
     })
+
+    if (response.status === 426) {
+      // Too old to earn: nothing queued will be credited, so drop it and say so.
+      const min = (JSON.parse(response.text) as { minVersion?: unknown }).minVersion
+
+      await $.store.set('queue', [])
+      await applyRelease($, { latest: typeof min === 'string' ? min : MOD_VERSION, min: typeof min === 'string' ? min : MOD_VERSION })
+
+      return
+    }
 
     if (!response.ok) {
       return
@@ -277,7 +326,9 @@ async function openTheater($: EngineInterface, turnId: string) {
           ? `snoozed for ${describeWait(run.theaterSnoozedUntil - now)} after you closed it`
           : (await read($, pausedUntil)) !== null
             ? 'ads are paused'
-            : undefined
+            : (await isUpdateRequired($))
+              ? 'this version is too old to earn; /ads update'
+              : undefined
 
   if (shut !== undefined) {
     run.theaterNote = `stayed shut: ${shut}`
@@ -426,6 +477,8 @@ async function stopSound($: EngineInterface) {
 }
 
 async function startSession($: EngineInterface) {
+  run.hasStarted = true
+
   for (const timer of run.timers.splice(0)) {
     timer.cancel()
   }
@@ -436,8 +489,8 @@ async function startSession($: EngineInterface) {
   await $.command
     .register({
       name: 'ads',
-      description: 'Tokenbreak ads: status, next, style, pause [1h|30m|today], resume, report',
-      argumentHint: '[status|next|style pill|pause 1h|resume|report]',
+      description: 'Tokenbreak ads: status, update, next, style, pause [1h|30m|today], resume, report',
+      argumentHint: '[status|update|next|style pill|pause 1h|resume|report]',
       immediate: true,
     })
     .catch(() => undefined)
@@ -455,6 +508,7 @@ async function startSession($: EngineInterface) {
 
   if (cached !== undefined && cached.ads.length > 0) {
     await showAds($, cached.ads)
+    await applyRelease($, cached.mod)
     await update($, source, () => 'cache' as AdSource)
   } else {
     await showAds($, HOUSE_ADS)
@@ -489,6 +543,16 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
     await setPause($, until)
 
     return `Tokenbreak paused for ${describeWait(until - now)}. /ads resume brings it back.`
+  }
+
+  if (verb === 'update') {
+    const state = await read($, updateState)
+    const where =
+      state.kind === 'current'
+        ? `You're on ${MOD_VERSION}, the latest.`
+        : `You're on ${MOD_VERSION}; ${state.latest} is out${state.kind === 'required' ? ' and needed to keep earning' : ''}.`
+
+    return `${where}\n${UPDATE_STEPS}`
   }
 
   if (verb === 'next') {
@@ -534,7 +598,7 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
   }
 
   if (verb !== 'status') {
-    return 'Usage: /ads [status|next|style pill|pause 1h|pause today|resume|report]'
+    return 'Usage: /ads [status|update|next|style pill|pause 1h|pause today|resume|report]'
   }
 
   const until = await read($, pausedUntil)
@@ -552,6 +616,7 @@ async function adsCommand($: EngineInterface, args: string): Promise<string> {
     `Tokenbreak · ${until === null ? 'on' : `paused, ${describeWait(until - now)} left`}`,
     `Showing: ${ad === undefined ? 'nothing' : `ad ${ad.id}`}`,
     `Ads from: ${origin}`,
+    `Version: ${MOD_VERSION}${(await read($, updateState)).kind === 'current' ? '' : ' (update out: /ads update)'}`,
     `Theater: ${run.isTheaterOn ? `on (fullscreen layout, 144+ columns, turns over 3s); last turn ${run.theaterNote}` : 'off'}`,
     ...(run.video.swapped + run.video.refused > 0
       ? [`Video: ${run.video.swapped} frames swapped, ${run.video.refused} refused${run.video.reason === undefined ? '' : ` (${run.video.reason})`}`]
@@ -575,8 +640,9 @@ async function closeTurn($: EngineInterface, turnId: string) {
     await update($, theater, () => null)
   }
 
-  // Only ads the ad server served count; built-in house ads are never reported.
-  if ((await read($, source)) === 'built-in' || (await read($, pausedUntil)) !== null) {
+  // Only ads the ad server served count; built-in house ads are never reported, and
+  // a mod too old to earn reports nothing.
+  if ((await read($, source)) === 'built-in' || (await read($, pausedUntil)) !== null || (await isUpdateRequired($))) {
     return
   }
 
@@ -602,8 +668,20 @@ async function snoozeTheater($: EngineInterface) {
 export const register: Register = (on, options) => {
   run = runOf(options)
 
+  // A terminal session starts at once. The desktop's Code tab runs through the SDK, which
+  // starts with no surface and isInteractive false, like `claude -p`: there ads start when
+  // the app attaches, or at once when it already has (a reload). A plain -p run never draws
+  // and stays dormant.
   on('session.start', async ($, e, next) => {
-    if (e.isInteractive) {
+    if (e.isInteractive || (await $.session.surfaces()).length > 0) {
+      await startSession($)
+    }
+
+    return next(e)
+  })
+
+  on('session.attach', async ($, e, next) => {
+    if (!run.hasStarted) {
       await startSession($)
     }
 
@@ -625,10 +703,34 @@ export const register: Register = (on, options) => {
     const until = await read($, pausedUntil)
     const ad = currentBanner(await read($, ads), await read($, bannerIndex))
 
-    if (e.props.hasSurvey || until !== null || ad === undefined) {
+    const state = await read($, updateState)
+
+    if (e.props.hasSurvey || until !== null || (ad === undefined && state.kind !== 'required')) {
       run.drawnBanner = undefined
 
       return next(e)
+    }
+
+    if (state.kind === 'required' || ad === undefined) {
+      // Too old to earn: the update notice takes the ad's place, and nothing is counted.
+      const { Box, Text } = $.ui.resolve(e)
+
+      run.drawnBanner = undefined
+
+      return (
+        <Box width={e.props.bodyColumns} marginTop={1} flexDirection="row" gap={1}>
+          <Text color={AD_YELLOW}>⬆</Text>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text wrap="truncate-end">
+              <Text bold>Update Tokenbreak to keep earning.</Text>
+              {state.kind === 'required' ? ` Version ${state.latest} is out; you have ${MOD_VERSION}.` : ''}
+            </Text>
+          </Box>
+          <Text backgroundColor={tint(AD_YELLOW, 0.22)} color={AD_YELLOW} bold>
+            {' /ads update '}
+          </Text>
+        </Box>
+      )
     }
 
     run.drawnBanner = ad.id

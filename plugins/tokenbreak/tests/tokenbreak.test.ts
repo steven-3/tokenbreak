@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import type { Impression } from '../types'
-import { BAND, command, complete, NAME, PANE, SESSION, START, THEATER, worldOf } from './world'
+import { BAND, command, complete, DESKTOP, HEADLESS, NAME, PANE, SESSION, START, THEATER, worldOf } from './world'
 
 const SURFACES = ['terminal', 'desktop'] as const
 
@@ -231,6 +231,7 @@ describe('impressions', () => {
     expect(posts).toHaveLength(1)
     expect(posts[0]?.url).toBe('https://tokenbreak.dev/api/v1/impressions')
     expect(JSON.parse(posts[0]?.body ?? '{}').impressions).toHaveLength(20)
+    expect(JSON.parse(posts[0]?.body ?? '{}').modVersion).toMatch(/^\d+\.\d+\.\d+$/)
     expect(world.store.get('queue')).toEqual([])
   })
 
@@ -245,5 +246,115 @@ describe('impressions', () => {
     await $.turn.complete(complete('t1'))
     await clock.settle()
     expect(world.store.get('queue')).toBeUndefined()
+  })
+})
+
+describe('updates', () => {
+  test('a mod too old to earn shows the update notice instead of ads, and reports nothing', async ($, on) => {
+    const world = worldOf(on, { release: { latest: '9.0.0', min: '9.0.0' } })
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(SESSION)
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'terminal' })
+
+    expect(await ui.find({ type: 'Text', text: 'Update Tokenbreak to keep earning.' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'sponsored' }), 'no ad while too old').toBeUndefined()
+
+    await $.turn.start({ text: '', turnId: 't1' })
+    await $.turn.complete(complete('t1'))
+    await clock.settle()
+    expect(world.store.get('queue'), 'nothing queued').toBeUndefined()
+
+    const steps = await $.command.run(command('update'))
+
+    expect(steps.text).toContain('9.0.0 is out and needed to keep earning')
+    expect(steps.text).toContain('/plugin update tokenbreak@tokenbreak')
+    expect(steps.text).toContain('Enable auto-update')
+  })
+
+  test('an update that is merely out leaves ads running', async ($, on) => {
+    worldOf(on, { release: { latest: '9.0.0', min: '0.0.1' } })
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(SESSION)
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'terminal' })
+
+    expect(await ui.find({ type: 'Text', text: 'sponsored' })).toBeDefined()
+    expect((await $.command.run(command('status'))).text).toContain('update out')
+  })
+
+  test('the server refusing an old version turns ads into the update notice and drops the queue', async ($, on) => {
+    const world = worldOf(on, {
+      ingestStatus: 426,
+      stored: { queue: Array.from({ length: 19 }, (_, n) => impression(n)) },
+    })
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(SESSION)
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'terminal' })
+
+    await $.turn.start({ text: '', turnId: 't1' })
+    await $.turn.complete(complete('t1'))
+    await clock.settle()
+
+    expect(world.store.get('queue')).toEqual([])
+    expect(await ui.find({ type: 'Text', text: 'Update Tokenbreak to keep earning.' })).toBeDefined()
+  })
+})
+
+describe('starting up', () => {
+  test('stays dormant in a -p run, where nothing draws', async ($, on) => {
+    const world = worldOf(on)
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(HEADLESS)
+    await clock.settle()
+
+    expect(world.commands).toEqual([])
+    expect(world.fetches).toEqual([])
+  })
+
+  test('starts when the desktop app attaches to an SDK session', async ($, on) => {
+    const world = worldOf(on)
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(HEADLESS)
+    await $.session.attach(DESKTOP)
+    await $.session.attach({ ...DESKTOP, clientId: 'desktop:second' })
+    await clock.settle()
+
+    expect(world.commands).toEqual(['ads'])
+    expect(world.fetches.filter(fetch => fetch.url.includes('/api/v1/ads'))).toHaveLength(1)
+
+    const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'desktop' })
+
+    expect(await ui.find({ type: 'Text', text: 'sponsored' })).toBeDefined()
+    expect((await $.command.run(command('status'))).text).toContain('Ads from: https://tokenbreak.dev')
+  })
+
+  test('starts at once on a reload while the desktop is already attached', async ($, on) => {
+    const world = worldOf(on, { surfaces: ['desktop'] })
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(HEADLESS)
+    await clock.settle()
+
+    expect(world.commands).toEqual(['ads'])
+  })
+
+  test('reads an endpoint typed without a scheme as https', { options: { endpoint: 'tokenbreak.dev/' } }, async ($, on) => {
+    const world = worldOf(on)
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(SESSION)
+    await clock.settle()
+
+    expect(world.fetches[0]?.url).toMatch(/^https:\/\/tokenbreak\.dev\/api\/v1\/ads\?/)
   })
 })
