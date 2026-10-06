@@ -5,7 +5,7 @@ import type { Ad, AdAudio, AdBatch, AdFormat, AdVideo, BannerStyle, Impression, 
  * reading a file, so it's written here too; tools/sync-public-mod.sh refuses to
  * publish unless it equals plugin.json's and the server's MOD_LATEST_VERSION.
  */
-export const MOD_VERSION = '0.3.2'
+export const MOD_VERSION = '0.3.3'
 
 export const THEATER_PANE = 'tokenbreak-theater'
 export const QUEUE_CAP = 200
@@ -179,8 +179,8 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
-/** The server's release info, when it sent a well-formed one. */
-function releaseOf(raw: unknown): ModRelease | undefined {
+/** The server's release info, when it sent a well-formed one: versions drawn on screen are digits and dots only. */
+export function releaseOf(raw: unknown): ModRelease | undefined {
   const mod = raw as { latest?: unknown; min?: unknown } | undefined
 
   return typeof mod?.latest === 'string' && typeof mod.min === 'string' && VERSION.test(mod.latest) && VERSION.test(mod.min)

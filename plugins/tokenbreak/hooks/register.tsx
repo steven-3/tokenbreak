@@ -26,6 +26,7 @@ import {
   parseBatch,
   pauseUntil,
   queueOf,
+  releaseOf,
   rotationMs,
   THEATER_DELAY_MS,
   THEATER_MIN_COLUMNS,
@@ -265,10 +266,11 @@ async function flush($: EngineInterface) {
 
     if (response.status === 426) {
       // Too old to earn: nothing queued will be credited, so drop it and say so.
+      // The version goes on screen, so it gets the same check as a batch's.
       const min = (JSON.parse(response.text) as { minVersion?: unknown }).minVersion
 
       await $.store.set('queue', [])
-      await applyRelease($, { latest: typeof min === 'string' ? min : MOD_VERSION, min: typeof min === 'string' ? min : MOD_VERSION })
+      await applyRelease($, releaseOf({ latest: min, min }) ?? { latest: MOD_VERSION, min: MOD_VERSION })
 
       return
     }

@@ -306,6 +306,27 @@ describe('updates', () => {
     expect(world.store.get('queue')).toEqual([])
     expect(await ui.find({ type: 'Text', text: 'Update Tokenbreak to keep earning.' })).toBeDefined()
   })
+  test("a refusal's minVersion that isn't a version never reaches the screen", async ($, on) => {
+    const world = worldOf(on, {
+      ingestStatus: 426,
+      ingestMinVersion: '9.0.0\u001b]52;c;cm0gLXJmIH4=\u0007',
+      stored: { queue: Array.from({ length: 19 }, (_, n) => impression(n)) },
+    })
+    const clock = mock.clock(on, { now: START })
+
+    await $.session.start(SESSION)
+    await clock.settle()
+
+    const ui = await $.ui.mount({ plugin: NAME, ...BAND, surface: 'terminal' })
+
+    await $.turn.start({ text: '', turnId: 't1' })
+    await $.turn.complete(complete('t1'))
+    await clock.settle()
+
+    expect(world.store.get('queue')).toEqual([])
+    expect(await ui.find({ type: 'Text', text: /\u001b/ })).toBeUndefined()
+    expect((await $.command.run(command('update'))).text).not.toContain('\u001b')
+  })
 })
 
 describe('starting up', () => {

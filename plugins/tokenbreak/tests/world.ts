@@ -117,6 +117,8 @@ export type WorldOptions = {
   release?: { latest: string; min: string }
   /** The status `POST /api/v1/impressions` answers when up; 200 unless set. */
   ingestStatus?: number
+  /** The `minVersion` a 426 answer carries; 9.0.0 unless set. */
+  ingestMinVersion?: string
   /** What `$.session.surfaces()` answers: empty, as in a -p run or before the desktop attaches. */
   surfaces?: readonly RenderSurface[]
 }
@@ -169,7 +171,7 @@ export function worldOf(on: On, options: WorldOptions = {}): World {
       value: !isIngestUp
         ? { status: 503, ok: false, headers: {}, text: '' }
         : options.ingestStatus === 426
-          ? { status: 426, ok: false, headers: {}, text: '{"minVersion":"9.0.0","accepted":0}' }
+          ? { status: 426, ok: false, headers: {}, text: JSON.stringify({ minVersion: options.ingestMinVersion ?? '9.0.0', accepted: 0 }) }
           : { status: 200, ok: true, headers: {}, text: '{"accepted":1}' },
     }
   })
