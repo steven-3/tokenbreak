@@ -20,8 +20,29 @@ import {
   withoutFrames,
   bannerStyleOf,
   theaterArt,
+  formatUserCode,
+  parseDeviceCode,
+  parseDevicePoll,
+  AD_LABEL,
+  MOD_HEADERS,
+  queueOf,
+  shownOf,
+  isPng,
+  activeHides,
+  endStretch,
+  freshOf,
+  IMPRESSION_MAX_AGE_MS,
+  longestPaid,
+  noteDrawn,
+  parseGrant,
+  reportArgsOf,
+  reportQueueOf,
+  rotationOf,
+  surfaceOf,
+  trackerOf,
 } from '../hooks/core'
-import { BATCH } from './world'
+import type { Ad } from '../types'
+import { BATCH, LOGO_PNG, SIGNED_BATCH } from './world'
 
 describe('core', () => {
   test('a Theater video parses, its rate held to 1-30 fps, and an empty or oversized one is dropped', () => {
@@ -59,35 +80,100 @@ describe('core', () => {
     expect(Math.abs(only.columns / only.rows - (16 / 9) * 2)).toBeLessThan(0.2)
   })
 
-  test('a server ad may carry video cuts and sound from the ad server, but never local files or other hosts', () => {
+  test('a server ad may carry video cuts, but never local files, and never sound', () => {
     const theater = { id: 't', format: 'theater', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
     const cut = { frames: ['a', 'b'], fps: 15, width: 9, height: 16, files: ['/etc/passwd'] }
     const server = 'https://tokenbreak.dev'
-    const withAudio = (audio: unknown) => parseBatch(JSON.stringify({ ads: [{ ...theater, audio }] }), server)?.ads[0]?.audio
+    const withAudio = (audio: unknown) => parseBatch(JSON.stringify({ ads: [{ ...theater, audio }] }))?.ads[0]?.audio
     const ad = parseBatch(
       JSON.stringify({ ads: [{ ...theater, videos: [cut, cut, cut, cut], audio: { url: `${server}/m/s.m4a` } }] }),
-      server,
     )?.ads[0]
 
     expect(ad?.videos).toHaveLength(3)
     expect(ad?.videos?.[0]?.files).toBeUndefined()
-    expect(ad?.audio).toEqual({ url: `${server}/m/s.m4a` })
-    // An advertiser's own host would see each viewer's IP: a tracking pixel by another name.
+    // Theater never plays sound (FMT-03): not from the ad server, not from an advertiser's host
+    // (which would also see each viewer's IP), not a file of the plugin's own.
+    expect(ad?.audio).toBeUndefined()
     expect(withAudio({ url: 'https://tracker.example/s.m4a' })).toBeUndefined()
     expect(withAudio({ url: 'https://192.168.1.10/s.m4a' })).toBeUndefined()
     expect(withAudio({ asset: 'hooks/register.tsx' })).toBeUndefined()
-    // Without a known ad server, no sound at all.
-    expect(parseBatch(JSON.stringify({ ads: [{ ...theater, audio: { url: `${server}/m/s.m4a` } }] }))?.ads[0]?.audio).toBeUndefined()
   })
 
   test('a banner logo is kept only within its tiny budget', () => {
     const banner = { id: 'b', format: 'banner', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
-    const logo = (bytes: number) => ({ png: 'A'.repeat(Math.ceil(bytes / 3) * 4), width: 36, height: 36 })
+    // The real logo, padded out past its end to `bytes`.
+    const logo = (bytes: number) => ({ png: btoa(atob(LOGO_PNG).padEnd(bytes, '\0')), width: 36, height: 36 })
     const parse = (bytes: number) => parseBatch(JSON.stringify({ ads: [{ ...banner, logo: logo(bytes) }] }))?.ads[0]?.logo
 
     expect(parse(400)).toBeDefined()
     expect(parse(768)).toBeDefined()
+    expect(parse(769)).toBeUndefined()
     expect(parse(3000)).toBeUndefined()
+  })
+
+  test("a banner logo the terminal wouldn't take is dropped, so the banner draws its glyph", () => {
+    const png = atob(LOGO_PNG)
+    const banner = { id: 'b', format: 'banner', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
+    const parse = (logo: string) => parseBatch(JSON.stringify({ ads: [{ ...banner, logo: { png: logo, width: 36, height: 36 } }] }))?.ads[0]
+
+    expect(isPng(LOGO_PNG)).toBe(true)
+    expect(parse(LOGO_PNG)?.logo?.png).toBe(LOGO_PNG)
+
+    for (const [why, logo] of [
+      ['empty', ''],
+      ['not base64', `!!!!${LOGO_PNG}`],
+      ['unpadded', LOGO_PNG.replace(/=+$/, '')],
+      ['a JPEG', btoa(`\xff\xd8\xff\xe0${png.slice(4)}`)],
+      ['the signature alone', btoa(png.slice(0, 8))],
+      ['65536 pixels a side', btoa(`${png.slice(0, 16)}\x00\x01\x00\x00\x00\x01\x00\x00${png.slice(24)}`)],
+      ['0 pixels wide', btoa(`${png.slice(0, 16)}\x00\x00\x00\x00${png.slice(20)}`)],
+    ] as const) {
+      expect(isPng(logo), why).toBe(false)
+      expect(parse(logo)?.logo, why).toBeUndefined()
+      expect(parse(logo)?.brand, `${why}: the ad stays`).toBe('B')
+    }
+  })
+
+  test('a serve token is kept only as a string of 1 to 512 characters; the ad shows either way', () => {
+    const banner = { id: 'b', format: 'banner', brand: 'B', headline: 'h', accent: '#FFE600', clickUrl: 'https://a.dev' }
+    const parse = (serveToken: unknown) => parseBatch(JSON.stringify({ ads: [{ ...banner, serveToken }] }))?.ads[0]
+
+    expect(parse('v1.abc.sig')?.serveToken).toBe('v1.abc.sig')
+    expect(parse('t'.repeat(512))?.serveToken).toHaveLength(512)
+
+    for (const bad of ['t'.repeat(513), '', 42, null, { token: 'x' }, ['x']]) {
+      const ad = parse(bad)
+
+      expect(ad, JSON.stringify(bad).slice(0, 20)).toBeDefined()
+      expect(Object.keys(ad ?? {}), JSON.stringify(bad).slice(0, 20)).not.toContain('serveToken')
+    }
+
+    // A server that sends none: no token at all, as before.
+    expect(parseBatch(JSON.stringify(BATCH))?.ads.every(ad => !('serveToken' in ad))).toBe(true)
+  })
+
+  test("an impression takes the shown ad's own token, and a queued one loses a malformed token", () => {
+    const [acme, shipfast] = SIGNED_BATCH.ads
+
+    expect(shownOf(acme!)).toEqual({ adId: 'acme-banner', serveToken: 'serve.acme-banner.sig' })
+    expect(Object.keys(shownOf(shipfast!))).toEqual(['adId'])
+    expect(
+      queueOf([
+        { adId: 'a', format: 'banner', at: 1, serveToken: 'tok' },
+        { adId: 'b', format: 'banner', at: 2, serveToken: 7 },
+        { adId: 'c', format: 'banner', at: 3, serveToken: 'x'.repeat(513) },
+        { adId: 'd', format: 'banner', at: 4 },
+      ]).map(one => Object.keys(one).join()),
+    ).toEqual(['adId,format,at,serveToken', 'adId,format,at', 'adId,format,at', 'adId,format,at'])
+  })
+
+  test('the label and request headers are spelled as the ad server expects', () => {
+    expect(AD_LABEL).toBe('Ad')
+    expect(MOD_HEADERS).toEqual({
+      device: 'X-Tokenbreak-Device',
+      version: 'X-Tokenbreak-Version',
+      surface: 'X-Tokenbreak-Surface',
+    })
   })
 
   test('versions compare part by part, and the update state follows the server', () => {
@@ -216,5 +302,157 @@ describe('core', () => {
     expect(art.width).toBe(256)
     expect(art.height).toBe(144)
     expect(atob(art.rgba).length).toBe(256 * 144 * 4)
+  })
+})
+
+describe('/ads login parsing', () => {
+  test('reads the device code answer, with the code filled into the link', () => {
+    const code = parseDeviceCode(
+      JSON.stringify({
+        device_code: 'd',
+        user_code: 'WXYZ2345',
+        verification_uri: 'https://tokenbreak.dev/device',
+        verification_uri_complete: 'https://tokenbreak.dev/device?user_code=WXYZ2345',
+        expires_in: 900,
+        interval: 5,
+      }),
+    )
+
+    expect(code).toEqual({
+      deviceCode: 'd',
+      userCode: 'WXYZ2345',
+      url: 'https://tokenbreak.dev/device?user_code=WXYZ2345',
+      intervalMs: 5_000,
+      expiresInMs: 900_000,
+    })
+    expect(parseDeviceCode('{"device_code":"d","user_code":"u","verification_uri":"javascript:alert(1)"}'), 'not a web link').toBeUndefined()
+    expect(parseDeviceCode('<html>'), 'not JSON').toBeUndefined()
+  })
+
+  test('shows an 8-letter code as two halves', () => {
+    expect(formatUserCode('WXYZ2345')).toBe('WXYZ-2345')
+    expect(formatUserCode('ABC')).toBe('ABC')
+  })
+
+  test('a poll signs in, waits, slows down, or gives up', () => {
+    expect(parseDevicePoll(200, '{"access_token":"t","expires_in":1}')).toEqual({ kind: 'token', token: 't' })
+    expect(parseDevicePoll(400, '{"error":"authorization_pending"}')).toEqual({ kind: 'wait', slower: false })
+    expect(parseDevicePoll(400, '{"error":"slow_down"}')).toEqual({ kind: 'wait', slower: true })
+    expect(parseDevicePoll(400, '{"error":"access_denied"}')).toEqual({ kind: 'stop', reason: 'denied' })
+    expect(parseDevicePoll(400, '{"error":"expired_token"}')).toEqual({ kind: 'stop', reason: 'expired' })
+    expect(parseDevicePoll(502, 'Bad gateway'), 'a hiccup keeps waiting').toEqual({ kind: 'wait', slower: false })
+  })
+
+  test('time on screen: the longest continuous stretch per ad, counted only while the turn runs', () => {
+    const [acme, shipfast] = BATCH.ads as [Ad, Ad]
+    const house = HOUSE_ADS[0] as Ad
+    let tracker = noteDrawn(trackerOf(true), acme, 0)
+
+    tracker = noteDrawn(tracker, acme, 500) // drawn again: the same stretch
+    tracker = noteDrawn(tracker, shipfast, 1_500) // Acme 1.5s
+    tracker = noteDrawn(tracker, acme, 2_000) // Shipfast 0.5s
+    tracker = noteDrawn(tracker, undefined, 2_800) // Acme 0.8s: its longest stays 1.5s
+    tracker = noteDrawn(tracker, house, 3_000)
+    tracker = endStretch(tracker, 60_000) // the house ad: 57s, never paid
+
+    expect(tracker.best['acme-banner']?.ms).toBe(1_500)
+    expect(tracker.best['shipfast-banner']?.ms).toBe(500)
+    expect(longestPaid(tracker, 1_000)).toMatchObject({ adId: 'acme-banner', ms: 1_500 })
+    expect(longestPaid(tracker, 2_000), 'none long enough').toBeUndefined()
+
+    // Outside a turn nothing is kept.
+    expect(endStretch(noteDrawn(trackerOf(false), acme, 0), 9_000).best).toEqual({})
+  })
+
+  test('a refreshed serve token carries the stretch on under the newest token', () => {
+    const acme = SIGNED_BATCH.ads[0] as Ad
+    const tracker = endStretch(noteDrawn(noteDrawn(trackerOf(true), acme, 0), { ...acme, serveToken: 'serve.new' }, 4_000), 5_000)
+
+    expect(tracker.best['acme-banner']).toEqual({ adId: 'acme-banner', serveToken: 'serve.new', isHouse: false, ms: 5_000 })
+  })
+
+  test('impressions older than 24h are dropped', () => {
+    const now = 10 * IMPRESSION_MAX_AGE_MS
+    const at = (age: number) => ({ adId: 'a', format: 'banner' as const, at: now - age })
+
+    expect(freshOf([at(IMPRESSION_MAX_AGE_MS + 1), at(IMPRESSION_MAX_AGE_MS), at(0)], now)).toEqual([at(IMPRESSION_MAX_AGE_MS), at(0)])
+  })
+
+  test('hides: expired and malformed ones drop; rotation skips hidden campaigns and waits on house ads', () => {
+    expect(activeHides({ a: 5, b: 20, c: 'x' }, 10)).toEqual({ b: 20 })
+    expect(activeHides(null, 10)).toEqual({})
+
+    const ads = BATCH.ads.map(ad => ({ ...ad, campaignId: `camp-${ad.brand}` }))
+    const ids = (list: Ad[]) => list.map(ad => ad.id)
+
+    expect(ids(rotationOf(ads, { 'camp-Acme DB': 99 }, 10))).toEqual(['shipfast-banner'])
+    expect(ids(rotationOf(ads, { 'camp-Acme DB': 5 }, 10)), 'expired').toEqual(ids(ads))
+    // Every paid banner hidden, or waiting for a seat: the built-in house banners stand in.
+    expect(rotationOf(ads, { 'camp-Acme DB': 99, 'camp-Shipfast': 99 }, 10).every(ad => ad.isHouse)).toBe(true)
+    expect(rotationOf(ads, {}, 10, 'waiting').every(ad => ad.isHouse)).toBe(true)
+    // An ad with no campaign hides by its own id.
+    expect(ids(rotationOf(BATCH.ads, { 'acme-banner': 99 }, 10))).toEqual(['shipfast-banner', 'acme-theater'])
+  })
+
+  test('a turn grant parses, and anything else is none', () => {
+    expect(parseGrant('{"turnId":"t","turnToken":"x.y","issuedAt":5}')).toEqual({ turnId: 't', turnToken: 'x.y', issuedAt: 5 })
+    expect(parseGrant('{"turnId":"t","turnToken":"","issuedAt":5}')).toBeUndefined()
+    expect(parseGrant(`{"turnId":"t","turnToken":"${'x'.repeat(513)}","issuedAt":5}`)).toBeUndefined()
+    expect(parseGrant('{"error":"Too many turns"}')).toBeUndefined()
+    expect(parseGrant('<html>')).toBeUndefined()
+  })
+
+  test('/ads report words: a known reason first, the rest the note', () => {
+    expect(reportArgsOf([])).toEqual({ reason: 'other' })
+    expect(reportArgsOf(['SCAM', 'fake', 'wallet'])).toEqual({ reason: 'scam', note: 'fake wallet' })
+    expect(reportArgsOf(['hide'])).toEqual({ reason: 'other', note: 'hide' })
+    expect(reportArgsOf(['looks', 'off'])).toEqual({ reason: 'other', note: 'looks off' })
+    expect(reportArgsOf(['broken', 'x'.repeat(400)]).note).toHaveLength(280)
+  })
+
+  test('the report queue keeps well-formed reports only', () => {
+    expect(
+      reportQueueOf([
+        { adId: 'a', reason: 'scam', at: 1, note: 'n', serveToken: 's' },
+        { adId: 'b', reason: 'hide', at: 2 },
+        { adId: 'c', reason: 'nope', at: 3 },
+        { adId: 'd', at: 4 },
+        'x',
+      ]),
+    ).toEqual([
+      { adId: 'a', serveToken: 's', reason: 'scam', note: 'n', at: 1 },
+      { adId: 'b', reason: 'hide', at: 2 },
+    ])
+  })
+
+  test('0.6.0 batches: campaigns, seats and the kill switch parse; the surface is terminal or desktop', () => {
+    const batch = parseBatch(
+      JSON.stringify({
+        ...BATCH,
+        ads: [{ ...BATCH.ads[0], campaignId: 'camp-1' }],
+        seat: 'waiting',
+        mod: { latest: '0.7.0', min: '0.6.0', blocked: true },
+      }),
+    )
+
+    expect(batch?.ads[0]?.campaignId).toBe('camp-1')
+    expect(batch?.seat).toBe('waiting')
+    expect(batch?.mod).toEqual({ latest: '0.7.0', min: '0.6.0', blocked: true })
+    expect(parseBatch(JSON.stringify({ ...BATCH, seat: 'vip' }))?.seat).toBeUndefined()
+    expect(updateStateOf({ latest: '0.7.0', min: '0.6.0', blocked: true })).toEqual({ kind: 'blocked', latest: '0.7.0' })
+    expect(updateStateOf({ latest: MOD_VERSION, min: MOD_VERSION, blocked: true }).kind, 'even when current').toBe('blocked')
+    expect([surfaceOf('terminal'), surfaceOf('desktop'), surfaceOf('vscode')]).toEqual(['terminal', 'desktop', 'desktop'])
+  })
+
+  test('queued impressions keep their turn token, surface and time on screen when well formed', () => {
+    expect(
+      queueOf([
+        { adId: 'a', format: 'banner', at: 1, turnToken: 'tt', surface: 'desktop', shownMs: 1200 },
+        { adId: 'b', format: 'banner', at: 2, turnToken: '', surface: 'tv', shownMs: -1 },
+      ]),
+    ).toEqual([
+      { adId: 'a', format: 'banner', at: 1, turnToken: 'tt', surface: 'desktop', shownMs: 1200 },
+      { adId: 'b', format: 'banner', at: 2 },
+    ])
   })
 })

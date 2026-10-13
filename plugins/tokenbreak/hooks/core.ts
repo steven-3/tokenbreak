@@ -1,11 +1,77 @@
-import type { Ad, AdAudio, AdBatch, AdFormat, AdVideo, BannerStyle, Impression, ModRelease, UpdateState } from '../types'
+import type {
+  Ad,
+  AdBatch,
+  AdFormat,
+  AdReport,
+  AdReportReason,
+  AdSurface,
+  AdVideo,
+  BannerStyle,
+  Impression,
+  ModRelease,
+  Seat,
+  TurnGrant,
+  UpdateState,
+} from '../types'
 
 /**
  * This build's version. A hooks module can't read its own plugin.json without
  * reading a file, so it's written here too; tools/sync-public-mod.sh refuses to
  * publish unless it equals plugin.json's and the server's MOD_LATEST_VERSION.
  */
-export const MOD_VERSION = '0.3.3'
+export const MOD_VERSION = '0.6.0'
+
+/** What every ad says it is, in the banner and the Theater. Short on purpose: terminal columns go to the headline. */
+export const AD_LABEL = 'Ad'
+
+/**
+ * The headers `GET /api/v1/ads` and `POST /api/v1/turns` carry besides the
+ * session token: this install's random device id, the mod's version, and where
+ * ads are drawn (`terminal` or `desktop`), so the server can sign each serve for
+ * this device. Nothing else about the person.
+ */
+export const MOD_HEADERS = {
+  device: 'X-Tokenbreak-Device',
+  version: 'X-Tokenbreak-Version',
+  surface: 'X-Tokenbreak-Surface',
+} as const
+
+/**
+ * How long an ad must stay on screen, continuously, for the turn's end to report
+ * it: the MRC display standard's one second for the banner, two for the Theater.
+ */
+export const MIN_SHOWN_MS = { banner: 1_000, theater: 2_000 } as const satisfies Record<AdFormat, number>
+
+/** Impressions older than this earn nothing, so the mod drops them rather than send them. */
+export const IMPRESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+/** The banner shows while a turn runs and this long after it ends, then hides until the next turn. */
+export const BANNER_LINGER_MS = 30_000
+
+/** Narrower terminals than this get no banner at all. */
+export const BANNER_MIN_COLUMNS = 80
+
+/** `✕` hides that campaign on this machine for this many days. */
+export const HIDE_CAMPAIGN_DAYS = 30
+export const HIDE_CAMPAIGN_MS = HIDE_CAMPAIGN_DAYS * 24 * 60 * 60 * 1000
+
+/** `POST /api/v1/turns` never holds a turn up: an answer later than this is ignored. */
+export const TURN_TIMEOUT_MS = 3_000
+
+/** The server grants no token to turns closer together than this on one device, so the mod doesn't ask. */
+export const TURN_MIN_GAP_MS = 10_000
+
+/** Reasons `/ads report` takes; `hide` is the `✕` button's own. */
+export const REPORT_REASONS = ['scam', 'misleading', 'offensive', 'broken', 'other'] as const satisfies readonly AdReportReason[]
+export const REPORT_NOTE_MAX = 280
+/** Reports wait here while the server can't be reached; the oldest give way past this. */
+export const REPORT_QUEUE_CAP = 50
+
+/** `terminal`, or `desktop` for every surface that isn't one (the desktop app's Code tab). */
+export const surfaceOf = (surface: unknown): AdSurface => (surface === 'terminal' ? 'terminal' : 'desktop')
+
+/** The longest serve token the mod keeps; a longer or empty one is dropped and the ad shows without it. */
+export const SERVE_TOKEN_MAX = 512
 
 export const THEATER_PANE = 'tokenbreak-theater'
 export const QUEUE_CAP = 200
@@ -42,7 +108,7 @@ export const HOUSE_ADS: readonly Ad[] = [
     format: 'banner',
     brand: 'Tokenbreak',
     glyph: '◆',
-    headline: 'Earn toward your subscription while you wait. Opening soon.',
+    headline: 'Earn USDC while Claude thinks. Half of every paid ad.',
     accent: '#8C91FF',
     clickUrl: 'https://tokenbreak.dev/earn',
     isHouse: true,
@@ -108,6 +174,31 @@ export const plain = (value: string, max: number): string =>
     .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
     .slice(0, max)
 
+const PNG_SIGNATURE = '\x89PNG\r\n\x1a\n'
+
+/**
+ * Whether `base64` is a PNG the terminal takes: standard padded base64 that
+ * opens with the PNG signature and an IHDR of 1 to 4096 pixels a side. The
+ * engine refuses a whole drawing over one picture that isn't.
+ */
+export function isPng(base64: string): boolean {
+  if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
+    return false
+  }
+
+  // The signature, the IHDR chunk's length and name, then its width and height: 24 bytes.
+  const head = atob(base64.slice(0, 32))
+  const side = (at: number) =>
+    ((head.charCodeAt(at) << 24) | (head.charCodeAt(at + 1) << 16) | (head.charCodeAt(at + 2) << 8) | head.charCodeAt(at + 3)) >>> 0
+
+  return (
+    head.length === 24 &&
+    head.startsWith(PNG_SIGNATURE) &&
+    head.slice(12, 16) === 'IHDR' &&
+    [side(16), side(20)].every(px => px >= 1 && px <= 4096)
+  )
+}
+
 /** A `{ png, width, height }` whose PNG decodes to at most `maxBytes`. */
 const isImage = (value: Record<string, unknown> | undefined, maxBytes: number): value is Record<string, unknown> =>
   typeof value === 'object' &&
@@ -142,26 +233,6 @@ function videoOf(raw: unknown): AdVideo | undefined {
   return { frames: frames as string[], fps: Math.min(30, Math.max(1, video.fps)), width: video.width, height: video.height }
 }
 
-/**
- * A server ad's sound: a URL on the ad server itself (`mediaOrigin`), never a
- * third party's. The engine fetches it from the person's machine, so any other
- * host would see their IP each time an ad played (a tracking pixel) or could be
- * a host on their local network. A server may not name the plugin's files either.
- */
-function audioOf(raw: unknown, mediaOrigin: string | undefined): AdAudio | undefined {
-  const url = (raw as { url?: unknown } | undefined)?.url
-
-  if (mediaOrigin === undefined || typeof url !== 'string' || url.length > 2048) {
-    return undefined
-  }
-
-  try {
-    return new URL(url).origin === mediaOrigin ? { url } : undefined
-  } catch {
-    return undefined
-  }
-}
-
 const VERSION = /^\d+\.\d+\.\d+$/
 
 /** `a` compared with `b`, part by part: negative when older, 0 when equal. */
@@ -179,17 +250,24 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
-/** The server's release info, when it sent a well-formed one: versions drawn on screen are digits and dots only. */
-export function releaseOf(raw: unknown): ModRelease | undefined {
-  const mod = raw as { latest?: unknown; min?: unknown } | undefined
+/** The server's release info, when it sent a well-formed one. */
+function releaseOf(raw: unknown): ModRelease | undefined {
+  const mod = raw as { latest?: unknown; min?: unknown; blocked?: unknown } | undefined
 
   return typeof mod?.latest === 'string' && typeof mod.min === 'string' && VERSION.test(mod.latest) && VERSION.test(mod.min)
-    ? { latest: mod.latest, min: mod.min }
+    ? { latest: mod.latest, min: mod.min, ...(mod.blocked === true && { blocked: true }) }
     : undefined
 }
 
-/** Where `version` stands against the server's releases; current when the server didn't say. */
+/**
+ * Where `version` stands against the server's releases; current when the server
+ * didn't say. A build the server switched off is `blocked` whatever its number.
+ */
 export function updateStateOf(release: ModRelease | undefined, version = MOD_VERSION): UpdateState {
+  if (release?.blocked === true) {
+    return { kind: 'blocked', latest: release.latest }
+  }
+
   if (release === undefined || compareVersions(version, release.latest) >= 0) {
     return { kind: 'current' }
   }
@@ -199,18 +277,28 @@ export function updateStateOf(release: ModRelease | undefined, version = MOD_VER
     : { kind: 'available', latest: release.latest }
 }
 
+/**
+ * How to turn on auto-update for the tokenbreak marketplace, as Claude Code's
+ * docs give it (code.claude.com/docs/en/plugins/host-marketplace, "Turn on
+ * auto-update"): it's off for every marketplace outside Anthropic's own.
+ */
+export const AUTO_UPDATE_STEPS = 'Get updates automatically: /plugin → Marketplaces → tokenbreak → Enable auto-update.'
+
 /** What `/ads update` prints: how to update now, and how never to fall behind again. */
 export const UPDATE_STEPS = [
   'Update Tokenbreak:',
   '  /plugin marketplace update tokenbreak',
   '  /plugin update tokenbreak@tokenbreak',
   '  /reload-plugins',
-  'Get updates automatically: /plugin → Marketplaces → tokenbreak → Enable auto-update.',
+  AUTO_UPDATE_STEPS,
 ].join('\n')
 
 const isFormat = (value: unknown): value is AdFormat => value === 'banner' || value === 'theater'
 
-function adOf(raw: unknown, mediaOrigin: string | undefined): Ad | undefined {
+export const isServeToken = (value: unknown): value is string =>
+  typeof value === 'string' && value.length > 0 && value.length <= SERVE_TOKEN_MAX
+
+function adOf(raw: unknown): Ad | undefined {
   if (typeof raw !== 'object' || raw === null) {
     return undefined
   }
@@ -226,9 +314,10 @@ function adOf(raw: unknown, mediaOrigin: string | undefined): Ad | undefined {
         return cut === undefined ? [] : [cut]
       })
     : []
-  const audio = audioOf(ad.audio, mediaOrigin)
   const logo = ad.logo as Record<string, unknown> | undefined
-  const hasLogo = isImage(logo, LOGO_MAX_BYTES)
+  // A logo the terminal wouldn't take is dropped for the glyph: the engine would refuse
+  // the whole band over it, and the turn would still count the banner it never showed.
+  const hasLogo = isImage(logo, LOGO_MAX_BYTES) && isPng(logo.png as string)
 
   if (
     typeof ad.id !== 'string' ||
@@ -254,18 +343,18 @@ function adOf(raw: unknown, mediaOrigin: string | undefined): Ad | undefined {
     }),
     ...(video !== undefined && { video }),
     ...(videos.length > 0 && { videos }),
-    ...(audio !== undefined && { audio }),
     ...(hasLogo && { logo: { png: logo.png as string, width: logo.width as number, height: logo.height as number } }),
     isHouse: ad.isHouse === true,
+    ...(typeof ad.campaignId === 'string' && ad.campaignId.length > 0 && { campaignId: plain(ad.campaignId, 64) }),
+    ...(isServeToken(ad.serveToken) && { serveToken: ad.serveToken }),
   }
 }
 
 /**
  * An `AdBatch` from the API's JSON, its malformed ads dropped; undefined when it
- * isn't one. Ad sound is kept only when it's served from `mediaOrigin`, the ad
- * server's own origin; without one, no sound is kept.
+ * isn't one. Ads never carry sound: the Theater is silent (FMT-03).
  */
-export function parseBatch(text: string, mediaOrigin?: string): AdBatch | undefined {
+export function parseBatch(text: string): AdBatch | undefined {
   try {
     const raw = JSON.parse(text) as Record<string, unknown>
 
@@ -273,16 +362,18 @@ export function parseBatch(text: string, mediaOrigin?: string): AdBatch | undefi
       return undefined
     }
 
-    const ads = raw.ads.map(one => adOf(one, mediaOrigin)).filter((ad): ad is Ad => ad !== undefined)
+    const ads = raw.ads.map(one => adOf(one)).filter((ad): ad is Ad => ad !== undefined)
     const ttl = typeof raw.ttlSeconds === 'number' && raw.ttlSeconds > 0 ? raw.ttlSeconds : 600
 
     const mod = releaseOf(raw.mod)
+    const seat = raw.seat === 'earning' || raw.seat === 'waiting' ? (raw.seat as Seat) : undefined
 
     return {
       ads,
       ttlSeconds: Math.min(ttl, 24 * 3600),
       servedAt: typeof raw.servedAt === 'string' ? raw.servedAt : '',
       ...(mod !== undefined && { mod }),
+      ...(seat !== undefined && { seat }),
     }
   } catch {
     return undefined
@@ -392,26 +483,238 @@ export function currentBanner(ads: readonly Ad[], index: number): Ad | undefined
   return banners.length === 0 ? undefined : banners[((index % banners.length) + banners.length) % banners.length]
 }
 
+/** What `✕` hides: the ad's campaign, or the ad itself when the server names none. */
+export const hideKeyOf = (ad: Ad): string => ad.campaignId ?? ad.id
+
+/** The hides still in force at `now`, expired ones dropped; malformed ones too. */
+export function activeHides(raw: unknown, now: number): Record<string, number> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return {}
+  }
+
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>).filter(
+      (entry): entry is [string, number] => typeof entry[1] === 'number' && entry[1] > now,
+    ),
+  )
+}
+
+const isHiddenAt = (ad: Ad, hidden: Readonly<Record<string, number>>, now: number) => (hidden[hideKeyOf(ad)] ?? 0) > now
+
+/**
+ * The ads rotation draws from: hidden campaigns skipped, and only house ads while
+ * the account waits for an earning seat. When that leaves no banner, the built-in
+ * house banners that aren't hidden stand in.
+ */
+export function rotationOf(
+  ads: readonly Ad[],
+  hidden: Readonly<Record<string, number>>,
+  now: number,
+  seat: Seat | null = null,
+): Ad[] {
+  const shown = ads.filter(ad => !isHiddenAt(ad, hidden, now) && (seat !== 'waiting' || ad.isHouse))
+
+  return bannersOf(shown).length > 0
+    ? shown
+    : [...shown, ...HOUSE_ADS.filter(ad => ad.format === 'banner' && !isHiddenAt(ad, hidden, now))]
+}
+
+/** The server's turn grant from its JSON; undefined when it isn't one. */
+export function parseGrant(text: string): TurnGrant | undefined {
+  try {
+    const raw = JSON.parse(text) as Record<string, unknown>
+
+    return typeof raw.turnId === 'string' &&
+      raw.turnId.length <= 64 &&
+      typeof raw.turnToken === 'string' &&
+      raw.turnToken.length > 0 &&
+      raw.turnToken.length <= 512 &&
+      typeof raw.issuedAt === 'number' &&
+      Number.isFinite(raw.issuedAt)
+      ? { turnId: raw.turnId, turnToken: raw.turnToken, issuedAt: raw.issuedAt }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** One ad's stretch on screen that hasn't ended yet. */
+export type Stretch = Pick<Impression, 'adId' | 'serveToken'> & { isHouse: boolean; since: number }
+
+/** The longest stretch an ad was on screen this turn. */
+export type Shown = Pick<Impression, 'adId' | 'serveToken'> & { isHouse: boolean; ms: number }
+
+/**
+ * What the mod knows of a format's time on screen this turn: the stretch running
+ * now, and each ad's longest finished one. It only counts between the turn's
+ * start and its end (`isCounting`); the banner's linger after the turn is never counted.
+ */
+export type ShownTracker = { isCounting: boolean; current?: Stretch; best: Record<string, Shown> }
+
+export const trackerOf = (isCounting = false): ShownTracker => ({ isCounting, best: {} })
+
+/** Ends the running stretch at `now`, keeping it if it's that ad's longest. */
+export function endStretch(tracker: ShownTracker, now: number): ShownTracker {
+  const { current } = tracker
+
+  if (current === undefined) {
+    return tracker
+  }
+
+  const ms = Math.max(0, now - current.since)
+  const kept = tracker.best[current.adId]
+  const best =
+    tracker.isCounting && (kept === undefined || ms > kept.ms)
+      ? {
+          ...tracker.best,
+          [current.adId]: {
+            adId: current.adId,
+            ...(current.serveToken !== undefined && { serveToken: current.serveToken }),
+            isHouse: current.isHouse,
+            ms,
+          },
+        }
+      : tracker.best
+
+  return { isCounting: tracker.isCounting, best }
+}
+
+/**
+ * The tracker after the mod drew `ad` (or nothing) at `now`: the same ad drawn
+ * again continues its stretch; any other change ends it and starts the next.
+ * Drawn means the mod handed the engine that tree: it can't see past that (a
+ * collapsed band, a window behind another), so a stretch runs from one draw to
+ * the next one that changes what shows.
+ */
+export function noteDrawn(tracker: ShownTracker, ad: Ad | undefined, now: number): ShownTracker {
+  const { current } = tracker
+
+  // A refreshed batch can hand the same ad a new serve token: the stretch goes on, under the newest one.
+  if (ad !== undefined && current?.adId === ad.id) {
+    const { serveToken: _old, ...rest } = current
+
+    return { ...tracker, current: { ...rest, ...(ad.serveToken !== undefined && { serveToken: ad.serveToken }) } }
+  }
+
+  const ended = endStretch(tracker, now)
+
+  return ad === undefined
+    ? ended
+    : { ...ended, current: { ...shownOf(ad), isHouse: ad.isHouse, since: now } }
+}
+
+/** The paid ad shown longest this turn, if it stayed at least `minMs`; house ads never count. */
+export function longestPaid(tracker: ShownTracker, minMs: number): Shown | undefined {
+  return Object.values(tracker.best)
+    .filter(one => !one.isHouse && one.ms >= minMs)
+    .reduce<Shown | undefined>((best, one) => (best === undefined || one.ms > best.ms ? one : best), undefined)
+}
+
+/** The queue without impressions too old to earn: the server would credit nothing from them. */
+export const freshOf = (queue: readonly Impression[], now: number): Impression[] =>
+  queue.filter(impression => now - impression.at <= IMPRESSION_MAX_AGE_MS)
+
+/** A report waiting to be sent, with when it was made. */
+export type QueuedReport = AdReport & { at: number }
+
+const isReason = (value: unknown): value is AdReportReason =>
+  value === 'hide' || (REPORT_REASONS as readonly unknown[]).includes(value)
+
+/** The report queue as the store holds it, malformed entries dropped. */
+export function reportQueueOf(raw: unknown): QueuedReport[] {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  return raw.flatMap((item: unknown) => {
+    const one = item as Partial<QueuedReport> | null
+
+    return typeof one === 'object' &&
+      one !== null &&
+      typeof one.adId === 'string' &&
+      one.adId.length > 0 &&
+      isReason(one.reason) &&
+      typeof one.at === 'number'
+      ? [
+          {
+            adId: one.adId,
+            ...(isServeToken(one.serveToken) && { serveToken: one.serveToken }),
+            reason: one.reason,
+            ...(typeof one.note === 'string' && one.note.length > 0 && { note: plain(one.note, REPORT_NOTE_MAX) }),
+            at: one.at,
+          },
+        ]
+      : []
+  })
+}
+
+/** `/ads report [reason] [note]`: the reason word (`other` when absent or unknown) and the rest as the note. */
+export function reportArgsOf(words: readonly string[]): { reason: Exclude<AdReportReason, 'hide'>; note?: string } {
+  const [first = '', ...rest] = words
+  const spoken = first.toLowerCase()
+  const isNamed = (REPORT_REASONS as readonly string[]).includes(spoken)
+  const note = plain((isNamed ? rest : words).join(' ').trim(), REPORT_NOTE_MAX).trim()
+
+  return {
+    reason: isNamed ? (spoken as Exclude<AdReportReason, 'hide'>) : 'other',
+    ...(note.length > 0 && { note }),
+  }
+}
+
+/** The welcome card the first sign-in shows once: Tokenbreak's own, never counted. */
+export const WELCOME_LINES = [
+  '✕ on an ad hides that advertiser for 30 days.',
+  '/ads pause stops ads (1h, 30m, 2h or today); /ads resume brings them back.',
+  'Your earnings: tokenbreak.dev/dashboard/earn',
+  'Turn on updates: /plugin → Marketplaces → tokenbreak → Enable auto-update.',
+] as const
+
+export const EARNINGS_URL = 'https://tokenbreak.dev/dashboard/earn'
+
+/** The line under the banner while the account waits for an earning seat. */
+export const WAITING_NOTICE = "You're on the list for an earning seat. Ads you see now don't pay yet."
+
 /** The newest `cap` impressions. */
 export const capQueue = (queue: readonly Impression[], cap = QUEUE_CAP): Impression[] =>
   queue.length <= cap ? [...queue] : queue.slice(queue.length - cap)
 
+/**
+ * What an impression takes from the ad on screen: its id, and its own serve
+ * token when it has one, so a token only ever travels with the ad it was served for.
+ */
+export const shownOf = (ad: Ad): Pick<Impression, 'adId' | 'serveToken'> => ({
+  adId: ad.id,
+  ...(ad.serveToken !== undefined && { serveToken: ad.serveToken }),
+})
+
 export const impressionKey = (impression: Impression) =>
   `${impression.adId}|${impression.format}|${impression.at}|${impression.turnId ?? ''}`
 
+/**
+ * The queue as the store holds it, malformed impressions dropped. A malformed
+ * serve token is left off rather than sent: the server would refuse the batch.
+ */
 export function queueOf(raw: unknown): Impression[] {
   if (!Array.isArray(raw)) {
     return []
   }
 
-  return raw.filter(
-    (item): item is Impression =>
-      typeof item === 'object' &&
-      item !== null &&
-      typeof (item as Impression).adId === 'string' &&
-      isFormat((item as Impression).format) &&
-      typeof (item as Impression).at === 'number',
-  )
+  return raw
+    .filter(
+      (item): item is Impression =>
+        typeof item === 'object' &&
+        item !== null &&
+        typeof (item as Impression).adId === 'string' &&
+        isFormat((item as Impression).format) &&
+        typeof (item as Impression).at === 'number',
+    )
+    .map(({ serveToken, turnToken, surface, shownMs, ...impression }) => ({
+      ...impression,
+      ...(isServeToken(serveToken) && { serveToken }),
+      ...(isServeToken(turnToken) && { turnToken }),
+      ...((surface === 'terminal' || surface === 'desktop') && { surface }),
+      ...(typeof shownMs === 'number' && Number.isInteger(shownMs) && shownMs >= 0 && { shownMs }),
+    }))
 }
 
 /** What the band saw of the surface the last time it drew. */
@@ -588,4 +891,79 @@ export function theaterArt(): { rgba: string; width: number; height: number } {
   art = { rgba: toBase64(bytes), width, height }
 
   return art
+}
+
+/** The client id `/ads login` sends; the site's device flow accepts no other. */
+export const MOD_CLIENT_ID = 'tokenbreak-mod'
+export const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code'
+
+/** `ABCDEFGH` as `ABCD-EFGH`, easier to compare by eye; the site ignores the dash. */
+export const formatUserCode = (code: string) => (code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code)
+
+/** What the site answered `/ads login` with (RFC 8628's device authorization response). */
+export type DeviceCode = {
+  deviceCode: string
+  userCode: string
+  /** Where to approve, with the code filled in when the site gives one. */
+  url: string
+  intervalMs: number
+  expiresInMs: number
+}
+
+export function parseDeviceCode(text: string): DeviceCode | undefined {
+  try {
+    const raw = JSON.parse(text) as Record<string, unknown>
+    const url = typeof raw.verification_uri_complete === 'string' ? raw.verification_uri_complete : raw.verification_uri
+
+    if (typeof raw.device_code !== 'string' || typeof raw.user_code !== 'string' || typeof url !== 'string' || !/^https?:\/\//.test(url)) {
+      return undefined
+    }
+
+    return {
+      deviceCode: raw.device_code,
+      userCode: raw.user_code,
+      url,
+      intervalMs: Math.max(1, Number(raw.interval) || 5) * 1000,
+      expiresInMs: Math.max(60, Number(raw.expires_in) || 900) * 1000,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** One poll of the token endpoint: signed in, keep waiting (slower when asked), or give up. */
+export type DevicePoll =
+  | { kind: 'token'; token: string }
+  | { kind: 'wait'; slower: boolean }
+  | { kind: 'stop'; reason: 'denied' | 'expired' | 'failed' }
+
+export function parseDevicePoll(status: number, text: string): DevicePoll {
+  let raw: Record<string, unknown> = {}
+
+  try {
+    raw = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    // A proxy's error page: keep waiting below.
+  }
+
+  if (status === 200 && typeof raw.access_token === 'string' && raw.access_token.length > 0) {
+    return { kind: 'token', token: raw.access_token }
+  }
+
+  switch (raw.error) {
+    case 'authorization_pending':
+      return { kind: 'wait', slower: false }
+    case 'slow_down':
+      return { kind: 'wait', slower: true }
+    case 'access_denied':
+      return { kind: 'stop', reason: 'denied' }
+    case 'expired_token':
+      return { kind: 'stop', reason: 'expired' }
+    case 'invalid_grant':
+    case 'invalid_request':
+      return { kind: 'stop', reason: 'failed' }
+    default:
+      // A 5xx or a dropped connection: try again on the next tick until the code expires.
+      return { kind: 'wait', slower: false }
+  }
 }
